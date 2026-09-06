@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>推理小说书架</title>
+<style>
+  :root {
+    --bg: #101216;
+    --ink: #e8e4d8;
+    --muted: #8a8f98;
+    --accent: #c9a86a;
+    --read: #4caf87;
+    --reading: #d9a441;
+    --wish: #6b7a8f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 50% -10%, #1d2129 0%, var(--bg) 60%);
+    color: var(--ink);
+    font-family: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", Georgia, serif;
+    min-height: 100vh;
+    padding: 48px 6vw 80px;
+  }
+  header { text-align: center; margin-bottom: 52px; }
+  header h1 { font-size: 30px; letter-spacing: 12px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  header .sub { margin-top: 12px; color: var(--muted); font-size: 13px; letter-spacing: 3px; }
+  header .rule { width: 64px; height: 1px; background: var(--accent); margin: 18px auto 0; opacity: .6; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+    gap: 34px 22px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .card {
+    position: relative;
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    opacity: 0;
+    animation: rise .5s ease forwards;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .cover {
+    width: 100%; aspect-ratio: 2 / 3; object-fit: cover;
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.45);
+    display: block;
+    transition: transform .28s ease, box-shadow .28s ease;
+  }
+  .cover.placeholder {
+    display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 12px;
+    background: linear-gradient(160deg, #232830, #1a1e25);
+    color: var(--muted); font-size: 14px; line-height: 1.5;
+    border: 1px solid #2a2f38;
+  }
+  .badge {
+    position: absolute; top: 8px; right: 8px; z-index: 2;
+    font-size: 11px; letter-spacing: 2px;
+    padding: 3px 8px; border-radius: 3px;
+    backdrop-filter: blur(4px);
+    font-family: sans-serif;
+  }
+  .badge.read    { background: rgba(76,175,135,.16);  color: var(--read);    border: 1px solid rgba(76,175,135,.45); }
+  .badge.reading { background: rgba(217,164,65,.14);  color: var(--reading); border: 1px solid rgba(217,164,65,.45); }
+  .badge.wish    { background: rgba(107,122,143,.16); color: var(--wish);    border: 1px solid rgba(107,122,143,.5); }
+
+  .card:hover .cover { transform: translateY(-6px); box-shadow: 0 14px 30px rgba(0,0,0,.6); }
+
+  .meta { margin-top: 12px; }
+  .meta .t { font-size: 15px; line-height: 1.45; transition: color .25s ease; }
+  .card:hover .meta .t { color: var(--accent); }
+  .meta .a { margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .meta .series { margin-top: 4px; font-size: 11px; color: var(--accent); opacity: .75; }
+
+  /* 已读书籍悬浮展示短评 */
+  .tip {
+    position: absolute;
+    left: 50%; bottom: calc(100% + 10px);
+    transform: translateX(-50%) translateY(4px);
+    width: 250px;
+    background: #20242c;
+    border: 1px solid #333a45;
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13px; line-height: 1.7; color: var(--ink);
+    box-shadow: 0 10px 28px rgba(0,0,0,.55);
+    opacity: 0; pointer-events: none;
+    transition: opacity .25s ease, transform .25s ease;
+    z-index: 10;
+  }
+  .tip b {
+    display: block; color: var(--accent); font-size: 11px;
+    letter-spacing: 2px; margin-bottom: 6px; font-family: sans-serif;
+  }
+  .card:hover .tip { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  footer {
+    text-align: center; margin-top: 64px;
+    color: var(--muted); font-size: 12px; letter-spacing: 2px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>推 理 小 说 <span>·</span> 书 架</h1>
+  <div class="sub">__COUNT__ 册 · 悬停已读书籍可查看短评 · 点击封面前往 claspclub</div>
+  <div class="rule"></div>
+</header>
+<div class="grid">
+__CARDS__
+</div>
+<footer>Mystery Novel Agent</footer>
+</body>
+</html>

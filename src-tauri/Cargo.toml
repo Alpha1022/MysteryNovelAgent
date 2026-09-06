@@ -1,0 +1,23 @@
+[package]
+name = "mystery-gui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# Android/iOS 以 cdylib 形式加载本库；桌面走 main.rs 二进制
+name = "mystery_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+mystery-novel-agent = { path = ".." }
+dunce = "1"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
