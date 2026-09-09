@@ -19,16 +19,15 @@
 #   build-ios        macos-latest：iOS 模拟器构建（未签名 zip，仅验证可编译；
 #                    真机安装需 Apple 开发者证书重新签名）
 #
-# Android 签名（gen/android 的 gradle 读取 rootProject 下
-#   .secure_files/upload-keystore.properties 的四项：
-#   storeFile / storePassword / keyAlias / keyPassword）：
-#   默认每次构建临时生成密钥 —— 演示可用，但覆盖安装需先卸载旧版。
-#   稳定签名：仓库 Settings → Secrets and variables → Actions → Secrets 配置：
-#     ANDROID_KEYSTORE_B64          keystore 文件内容（base64）
-#     ANDROID_KEYSTORE_PASSWORD     keystore 口令
-#     ANDROID_KEY_ALIAS             别名（缺省 release）
-#     ANDROID_KEYSTORE_KEY_PASSWORD 私钥口令（缺省同 keystore 口令）
-#   （本机开发：把属性文件放到 src-tauri/gen/android/.secure_files/，格式同上）
+# Android 签名（gen/android 的 gradle 读环境变量 KEYSTORE_FILE /
+#   KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD；CI 侧由 Secrets 提供）：
+#   仓库 Settings → Secrets and variables → Actions → Secrets 配置：
+#     KEYSTORE_BASE64      keystore 文件内容（base64；CI 解码后作为 KEYSTORE_FILE）
+#     KEYSTORE_PASSWORD    keystore 口令
+#     KEY_ALIAS            别名
+#     KEY_PASSWORD         私钥口令
+#   四项为必需 —— 缺失时构建前快速报错（keytool 预检口令与别名，
+#   避免全量编译后签名环节才失败）。
 #
 # 注意：私有仓库消耗 Actions 配额（macOS runner 按 10 倍计费），
 #   公开仓库免费；流水线并发做了去重（同分支新推送自动取消旧构建）。
@@ -192,43 +191,33 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
-      # 签名密钥：secrets 配置的稳定密钥优先，否则临时生成（覆盖安装需卸载）。
-      # gen/android 的 gradle 从 .secure_files/upload-keystore.properties 读取
-      # 签名（本机开发同款约定，目录被 .gitignore 忽略），CI 在构建前生成该文件
+      # 签名：解码 KEYSTORE_BASE64 → keystore 文件并预检（口令/别名正确性），
+      # 缺 Secrets 或密钥无效时快速失败 —— 不等全量 Rust 编译后才在签名环节报错
       - name: 准备签名密钥
         env:
-          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KS_KEY_PASS: ${{ secrets.ANDROID_KEYSTORE_KEY_PASSWORD }}
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -eu
-          if [ -n "$KS_B64" ]; then
-            printf '%s' "$KS_B64" | base64 -d > /tmp/ci.keystore
-            PASS="$KS_PASS"
-            ALIAS="${KS_ALIAS:-release}"
-            KEYPASS="${KS_KEY_PASS:-$KS_PASS}"
-            echo "使用稳定签名密钥"
-          else
-            keytool -genkeypair -keystore /tmp/ci.keystore -storepass androidci -keypass androidci \
-              -alias release -keyalg RSA -keysize 2048 -validity 10950 \
-              -dname "CN=mystery-novel-agent, O=course, C=CN" > /dev/null 2>&1
-            PASS=androidci
-            ALIAS=release
-            KEYPASS=androidci
-            echo "提示：使用临时签名密钥（稳定签名见文件头注释配置 Secrets）"
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ] || [ -z "$KS_KEY_PASS" ]; then
+            echo "::error::缺少 Android 签名 Secrets（KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），请在 Settings → Secrets and variables → Actions 配置"
+            exit 1
           fi
-          mkdir -p src-tauri/gen/android/.secure_files
-          cat > src-tauri/gen/android/.secure_files/upload-keystore.properties <<PROPS
-          storeFile=/tmp/ci.keystore
-          storePassword=$PASS
-          keyAlias=$ALIAS
-          keyPassword=$KEYPASS
-          PROPS
+          printf '%s' "$KS_B64" | base64 -d > /tmp/upload.keystore
+          keytool -list -keystore /tmp/upload.keystore -storepass "$KS_PASS" -alias "$KS_ALIAS" > /dev/null
+          echo "KEYSTORE_FILE=/tmp/upload.keystore" >> "$GITHUB_ENV"
+          echo "签名密钥就绪（alias=$KS_ALIAS）"
       - name: 前端依赖
         run: npm ci
         working-directory: frontend
       - name: 构建 APK
+        env:
+          # gradle 经环境变量读取签名四项（KEYSTORE_FILE 已入 GITHUB_ENV）
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: cargo tauri android build --apk --target aarch64 --target armv7
       - name: 收集产物
         run: |

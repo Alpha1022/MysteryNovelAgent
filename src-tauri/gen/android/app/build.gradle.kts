@@ -24,17 +24,17 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
-    val keystorePropertiesFile = rootProject.file(".secure_files/upload-keystore.properties")
-    val keystoreProperties = Properties()
-    if (keystorePropertiesFile.exists()) {
-        keystoreProperties.load(keystorePropertiesFile.inputStream())
-    }
     signingConfigs {
         create("release") {
-            storeFile = file(keystoreProperties["storeFile"])
-            storePassword = keystoreProperties["storePassword"]
-            keyAlias = keystoreProperties["keyAlias"]
-            keyPassword = keystoreProperties["keyPassword"]
+            // 签名经环境变量注入（CI Secrets 解码为 KEYSTORE_FILE 后与其余三项一起导出；
+            // 缺失时给出可读错误，而非 file(null) 的 NPE）
+            storeFile = file(
+                System.getenv("KEYSTORE_FILE")
+                    ?: error("缺少 KEYSTORE_FILE 环境变量（Android release 签名）")
+            )
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
         }
     }
     buildTypes {
