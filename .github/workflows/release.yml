@@ -324,12 +324,16 @@ jobs:
       - name: 发布
         env:
           GH_TOKEN: ${{ github.token }}
+          # 本 job 不做 checkout（只下载产物）——gh 无法从本地 git 解析
+          # 目标仓库，所有命令必须用 -R 显式指定
+          REPO: ${{ github.repository }}
         run: |
           set -eu
           echo "本次产物："; ls -la dist/
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             # 正式版本 Release
             gh release create "$GITHUB_REF_NAME" dist/* \
+              -R "$REPO" \
               --title "Release ${GITHUB_REF_NAME}" \
               --notes "标签 ${GITHUB_REF_NAME} 的自动构建产物：
           - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
@@ -339,8 +343,9 @@ jobs:
           - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）"
           else
             # 滚动预发布：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
-            gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
+            gh release delete continuous -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
             gh release create continuous dist/* \
+              -R "$REPO" \
               --prerelease \
               --target "$GITHUB_SHA" \
               --title "Latest build (${GITHUB_SHA::7})" \
