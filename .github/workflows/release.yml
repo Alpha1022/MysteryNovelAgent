@@ -1,0 +1,385 @@
+# ============================================================================
+# GitHub Actions：全平台自动构建与发布
+#
+# 推送方式（本地分支 master → GitHub main）：
+#   git push github master:main        # 滚动构建 + 维护 continuous 预发布
+#   git push github v0.1.0             # 正式 Release（需先在本地打 tag）
+#
+# 触发时机：
+#   - push 到 main / 手动触发 → 构建五平台产物：
+#     ① 上传 workflow artifacts（90 天）
+#     ② 维护滚动预发布 Release（tag 固定为 continuous，指向最新提交）
+#   - 推送 v* 标签 → 正式 Release（全部产物挂到该版本）
+#
+# 构建矩阵（GitHub 托管 runner，原生环境无需交叉编译）：
+#   build-windows    windows-latest：Tauri NSIS 安装包 + Windows CLI
+#   build-linux      ubuntu-24.04：deb + AppImage + Linux CLI
+#   build-android    ubuntu-latest：aarch64 + armv7 通用 APK（签名见下）
+#   build-macos      macos-latest（arm64）：universal DMG + universal CLI
+#   build-ios        macos-latest：iOS 模拟器构建（未签名 zip，仅验证可编译；
+#                    真机安装需 Apple 开发者证书重新签名）
+#
+# Android 签名（gen/android 的 gradle 读取 rootProject 下
+#   .secure_files/upload-keystore.properties 的四项：
+#   storeFile / storePassword / keyAlias / keyPassword）：
+#   默认每次构建临时生成密钥 —— 演示可用，但覆盖安装需先卸载旧版。
+#   稳定签名：仓库 Settings → Secrets and variables → Actions → Secrets 配置：
+#     ANDROID_KEYSTORE_B64          keystore 文件内容（base64）
+#     ANDROID_KEYSTORE_PASSWORD     keystore 口令
+#     ANDROID_KEY_ALIAS             别名（缺省 release）
+#     ANDROID_KEYSTORE_KEY_PASSWORD 私钥口令（缺省同 keystore 口令）
+#   （本机开发：把属性文件放到 src-tauri/gen/android/.secure_files/，格式同上）
+#
+# 注意：私有仓库消耗 Actions 配额（macOS runner 按 10 倍计费），
+#   公开仓库免费；流水线并发做了去重（同分支新推送自动取消旧构建）。
+# ============================================================================
+
+name: build-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # 发布 Release / 创建 continuous tag
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '5'
+  RUST_BACKTRACE: '1'
+  ANDROID_NDK_VERSION: 26.3.11579264
+
+jobs:
+  # ------------------------------------------------------------ Windows
+  build-windows:
+    name: Windows（NSIS + CLI）
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # 预编译安装 tauri-cli（失败则回退源码编译）
+      - name: 安装 tauri-cli（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+        continue-on-error: true
+      - name: 安装 tauri-cli（源码兜底）
+        shell: bash
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
+      - name: 前端依赖
+        run: npm ci
+        working-directory: frontend
+      - name: 构建 GUI（NSIS 安装包）
+        run: cargo tauri build --bundles nsis
+      - name: 构建 CLI
+        run: cargo build --release --locked -p mystery-novel-agent
+      - name: 收集产物
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/nsis/*-setup.exe dist/mystery-shelf-windows-x64-setup.exe
+          cp target/release/mystery-novel-agent.exe dist/mystery-novel-agent-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Linux
+  build-linux:
+    name: Linux（deb/AppImage + CLI）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # AppImage 打包工具（linuxdeploy）无 FUSE 也能跑
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装系统依赖（webkit2gtk-4.1 为 Tauri v2 所需）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf
+          # 24.04 的 fuse2 包名迁移到 libfuse2t64；两者都装不上也不致命
+          # （已设 APPIMAGE_EXTRACT_AND_RUN）
+          sudo apt-get install -y libfuse2 2>/dev/null \
+            || sudo apt-get install -y libfuse2t64 2>/dev/null || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装 tauri-cli（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+        continue-on-error: true
+      - name: 安装 tauri-cli（源码兜底）
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
+      - name: 前端依赖
+        run: npm ci
+        working-directory: frontend
+      - name: 构建 GUI（deb + AppImage）
+        run: cargo tauri build --bundles deb,appimage
+      - name: 构建 CLI
+        run: cargo build --release --locked -p mystery-novel-agent
+      - name: 收集产物
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/deb/*.deb dist/mystery-shelf-linux-amd64.deb
+          cp target/release/bundle/appimage/*.AppImage dist/mystery-shelf-linux-amd64.AppImage
+          cp target/release/mystery-novel-agent dist/mystery-novel-agent-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------ Android
+  build-android:
+    name: Android（arm64+armv7 APK）
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: 安装 tauri-cli（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+        continue-on-error: true
+      - name: 安装 tauri-cli（源码兜底）
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
+      # GitHub runner 自带 Android SDK（ANDROID_HOME 已设置），补装本项目
+      # 所需组件：compileSdk 36 / build-tools / NDK（gradle 8.14 + AGP 8.11）
+      - name: 安装 Android SDK 组件与 NDK
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" \
+            "build-tools;35.0.0" "build-tools;36.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}" > /dev/null
+          NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+      # 签名密钥：secrets 配置的稳定密钥优先，否则临时生成（覆盖安装需卸载）。
+      # gen/android 的 gradle 从 .secure_files/upload-keystore.properties 读取
+      # 签名（本机开发同款约定，目录被 .gitignore 忽略），CI 在构建前生成该文件
+      - name: 准备签名密钥
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.ANDROID_KEYSTORE_KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -n "$KS_B64" ]; then
+            printf '%s' "$KS_B64" | base64 -d > /tmp/ci.keystore
+            PASS="$KS_PASS"
+            ALIAS="${KS_ALIAS:-release}"
+            KEYPASS="${KS_KEY_PASS:-$KS_PASS}"
+            echo "使用稳定签名密钥"
+          else
+            keytool -genkeypair -keystore /tmp/ci.keystore -storepass androidci -keypass androidci \
+              -alias release -keyalg RSA -keysize 2048 -validity 10950 \
+              -dname "CN=mystery-novel-agent, O=course, C=CN" > /dev/null 2>&1
+            PASS=androidci
+            ALIAS=release
+            KEYPASS=androidci
+            echo "提示：使用临时签名密钥（稳定签名见文件头注释配置 Secrets）"
+          fi
+          mkdir -p src-tauri/gen/android/.secure_files
+          cat > src-tauri/gen/android/.secure_files/upload-keystore.properties <<PROPS
+          storeFile=/tmp/ci.keystore
+          storePassword=$PASS
+          keyAlias=$ALIAS
+          keyPassword=$KEYPASS
+          PROPS
+      - name: 前端依赖
+        run: npm ci
+        working-directory: frontend
+      - name: 构建 APK
+        run: cargo tauri android build --apk --target aarch64 --target armv7
+      - name: 收集产物
+        run: |
+          set -eu
+          mkdir -p dist
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name "*-release.apk" -type f | head -n1)
+          if [ -z "$APK" ]; then echo "未找到构建产物 APK"; exit 1; fi
+          cp "$APK" dist/mystery-shelf-android-universal.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: dist/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- macOS
+  build-macos:
+    name: macOS（universal DMG + CLI）
+    runs-on: macos-latest # arm64；产物为 universal（同时含 arm64 + x86_64）
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # universal-apple-darwin 不是 rustc 目标：tauri CLI 分别构建两架构后 lipo 合并
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装 tauri-cli（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+        continue-on-error: true
+      - name: 安装 tauri-cli（源码兜底）
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
+      - name: 前端依赖
+        run: npm ci
+        working-directory: frontend
+      - name: 构建 GUI（universal DMG）
+        run: cargo tauri build --target universal-apple-darwin --bundles dmg
+      - name: 构建 CLI（两架构 + lipo 合并为 universal）
+        run: |
+          cargo build --release --locked -p mystery-novel-agent --target aarch64-apple-darwin
+          cargo build --release --locked -p mystery-novel-agent --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/mystery-novel-agent-macos-universal \
+            target/aarch64-apple-darwin/release/mystery-novel-agent \
+            target/x86_64-apple-darwin/release/mystery-novel-agent
+      - name: 收集产物
+        run: cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/mystery-shelf-macos-universal.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- iOS
+  build-ios:
+    name: iOS（模拟器构建，未签名）
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios-sim
+      - uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装 tauri-cli（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tauri
+        continue-on-error: true
+      - name: 安装 tauri-cli（源码兜底）
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
+      - name: 前端依赖
+        run: npm ci
+        working-directory: frontend
+      # gen/apple 不入库（每次可再生），--ci 跳过交互提示
+      - name: 生成 iOS 工程
+        run: cargo tauri ios init --ci
+      # 无 Apple 开发者证书：直接 xcodebuild 打模拟器目标（绕过 tauri 的
+      # 签名导出流程），产物为未签名 .app（仅模拟器可装）
+      - name: xcodebuild（模拟器，未签名）
+        working-directory: src-tauri/gen/apple
+        run: |
+          set -eu
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/,""); print; exit}')
+          echo "scheme=${SCHEME}"
+          xcodebuild -scheme "$SCHEME" -configuration Release -sdk iphonesimulator -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          APP=$(find build/Build/Products -name "*.app" -type d | head -n1)
+          if [ -z "$APP" ]; then echo "未找到 .app 产物"; exit 1; fi
+          # gen/apple 上三级到仓库根：src-tauri/gen/apple → ../.. = src-tauri → ../../.. = 根
+          mkdir -p ../../../dist
+          ditto -c -k --keepParent "$APP" ../../../dist/mystery-shelf-ios-simulator-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-ios
+          path: dist/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- 发布
+  publish:
+    name: 发布
+    needs: [build-windows, build-linux, build-android, build-macos, build-ios]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          echo "本次产物："; ls -la dist/
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # 正式版本 Release
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Release ${GITHUB_REF_NAME}" \
+              --notes "标签 ${GITHUB_REF_NAME} 的自动构建产物：
+          - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
+          - Linux：deb / AppImage / CLI
+          - Android：universal APK（arm64 + armv7）
+          - macOS：universal DMG / CLI
+          - iOS：模拟器构建（未签名，仅验证可编译）"
+          else
+            # 滚动预发布：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
+            gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
+            gh release create continuous dist/* \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Latest build (${GITHUB_SHA::7})" \
+              --notes "main 分支最新构建（每次 push 自动更新）。
+
+          - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
+          - Linux：deb / AppImage / CLI
+          - Android：universal APK（arm64 + armv7）
+          - macOS：universal DMG / CLI
+          - iOS：模拟器构建（未签名，仅验证可编译）
+
+          正式版本见 v* 标签的 Release。"
+          fi

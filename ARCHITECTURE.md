@@ -481,16 +481,17 @@ model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 - **Android**：见 §15。
 - **诊断**：GUI 的 Rust 侧 `tracing` 日志 → `app.log`；前端可 `invoke('debug_log', {msg})` 转发；`RUST_LOG` 覆盖级别。
 
-### 20.1 CI 自动构建与发布（`.gitlab-ci.yml`）
+### 20.1 CI 自动构建与发布（双远端）
 
-仓库 remote 为 GitLab（git.tsinghua.edu.cn），CI 走 GitLab（GitHub Actions 不会在此 remote 运行）：
+**GitLab**（origin = git.tsinghua.edu.cn，`.gitlab-ci.yml`）—— Linux Docker runner，只构建两类产物（Android/macOS/iOS 移至 GitHub，GitLab 无对应 runner）：
+- `build:linux-cli`：Linux 原生 CLI；`build:windows`：**cargo-xwin 交叉编译**（`cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`）→ NSIS 安装包 + Windows CLI；
+- `publish:continuous` / `publish:release`：产物上传 generic package registry（continuous 同名覆盖 / `v*` 标签版本化），并维护**滚动 Release**（tag 固定 `continuous`：每次构建 DELETE 旧 Release 与 tag、再以当前提交经 Releases API 重建；tag 规则限定 `^v/` 防 CI 自建标签循环触发）。
 
-- **触发**：默认分支每次 push / 手动触发 → 滚动构建；推 `v*` 标签 → 正式 Release（**tag 规则限定 `^v/`**：CI 自建的 `continuous` 标签不会再次触发流水线，否则死循环且 Release 创建撞 409）。
-- **自动构建**（Linux Docker runner，产物进 continuous 包与 Release）：
-  - `build:linux-cli`：Linux 原生构建 CLI；
-  - `build:windows`：**cargo-xwin 交叉编译**（tauri 官方跨平台方案 `cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`，需 clang/llvm + nsis + node）→ NSIS 安装包 + Windows CLI；
-  - `build:android`：Android APK（`cargo tauri android build --apk --target aarch64 --target armv7`，JDK 17 + cmdline-tools 安装 SDK 36/NDK 26，gradle wrapper 自举）。**签名经环境变量**（gen/android 的 build.gradle.kts 读取 `KEYSTORE_FILE/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD`）：默认每次构建临时生成密钥（覆盖安装需先卸载），在 CI 变量配置 `ANDROID_KEYSTORE_B64` 等四项则用稳定密钥。
-- **手动 job**（`tags: [macos]` + `when: manual` + `allow_failure`——课程 GitLab 大概率无 macOS runner，不点击不影响流水线）：`build:macos` 出 DMG 并自行上传包仓库（标签流水线上运行时经 Release 链接 API 追加资产）；`build:ios` 为**未签名模拟器构建**（`cargo tauri ios init --ci` 现场生成 gen/apple + `xcodebuild -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO`，仅验证可编译，真机安装需开发者证书重签）。
-- `publish:continuous` / `publish:release`：三个自动构建的产物上传 generic package registry（continuous 同名覆盖 / 标签版本化），产物统一 ASCII 命名（原 NSIS 安装包名含中文）。**continuous 同时维护一个滚动 Release**（tag 固定为 `continuous`）：每次构建先 DELETE 旧 Release 与 tag（首次 404 属正常）、再以当前提交经 Releases API 重建（POST `tag_name=continuous` + `ref=$CI_COMMIT_SHA`），Release 页始终可直接下载最新产物；tag 删除若被权限拦截则退化为旧 tag 上重建（资产链接仍指向最新上传，仅源码快照偏旧）。`publish:release` 用 release-cli 建 `v*` 正式 Release。
-- **gen/android 随仓库分发**（Tauri 官方推荐）：Manifest 存储权限、Kotlin 插件（StoragePermissionPlugin）、签名配置都在其中；每次构建再生的文件（`tauri.settings.gradle` 含 cargo registry 绝对路径、`jniLibs/*.so`、generated/）由其自带 .gitignore 排除；`gradlew` 在 git index 中标记 755（Windows 提交默认丢执行位，Linux 上 gradle wrapper 会跑不起来）。根 .gitignore 只忽略 `gen/schemas/`。
-- 缓存：cargo registry / xwin SDK / Android SDK / gradle / npm（target 数 GB 不缓存，全量编译每 job 约 20–40 分钟）。
+**GitHub**（github remote = Alpha1022/MysteryNovelAgent，`.github/workflows/release.yml`）—— 托管 runner 原生环境五平台矩阵（推送映射 `git push github master:main`）：
+- `build-windows`（windows-latest）：NSIS 安装包 + CLI；
+- `build-linux`（ubuntu-24.04）：webkit2gtk-4.1 依赖 + **deb/AppImage** + CLI（`APPIMAGE_EXTRACT_AND_RUN=1` 免 FUSE）；
+- `build-android`（ubuntu-latest）：runner 自带 Android SDK，补装 SDK 36/NDK 26 + JDK 17，`cargo tauri android build --apk --target aarch64 --target armv7` → 通用 APK；**签名**：gen/android 的 gradle 读取 `.secure_files/upload-keystore.properties`（本机开发同款约定，目录被 .gitignore 忽略），CI 构建前从 secrets `ANDROID_KEYSTORE_B64` 等四项生成该文件（稳定密钥）→ 缺省每次构建临时 keytool 生成（覆盖安装需卸载）；
+- `build-macos`（macos-latest，arm64）：`--target universal-apple-darwin` DMG（tauri 双架构 lipo 合并）+ CLI（手动 lipo 为 universal）；
+- `build-ios`（macos-latest）：`tauri ios init --ci` 现场生成 gen/apple + `xcodebuild -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO` → **未签名模拟器 zip**（真机需开发者证书重签）；
+- `publish`：download-artifact 汇总（merge-multiple）→ `gh release create`：main push → 滚动 prerelease `continuous`（`--cleanup-tag` 删旧重建、`--target $GITHUB_SHA`）；`v*` 标签 → 正式 Release（需单独 `git push github v0.1.0`）；
+- 共性：tauri-cli 走 taiki-e/install-action 预编译（失败回退源码）、swatinem/rust-cache 缓存 Rust、setup-node 缓存 npm、并发去重（cancel-in-progress）；**gen/android 入库**（Manifest 权限/Kotlin 插件/签名配置，`gradlew` 在 git index 标记 755 —— Windows 提交默认丢执行位）。私有仓库注意 macOS runner 按 10 倍计费分钟数。

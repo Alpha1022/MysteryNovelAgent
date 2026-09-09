@@ -1,5 +1,7 @@
 # ============================================================================
-# GitLab CI：自动构建与发布
+# GitLab CI：自动构建与发布（GitLab 侧仅构建 Linux CLI + Windows；
+# Android / macOS / iOS 的完整构建矩阵在 GitHub Actions，
+# 见 .github/workflows/release.yml）
 #
 # 触发时机：
 #   - 默认分支每次 push / 手动触发 → 构建全部产物并：
@@ -15,26 +17,6 @@
 #   build:linux-cli   Linux CLI（原生构建）
 #   build:windows     Windows：Tauri NSIS 安装包 + CLI
 #                     （cargo-xwin 交叉编译，tauri 官方 Linux→Windows 方案）
-#   build:android     Android APK（aarch64 + armv7 通用包，Tauri 官方
-#                     Android 工具链 + gradle wrapper；签名见下）
-#
-# 手动 job（需要带 macos tag 的 runner；课程 GitLab 大概率没有——
-# 不点击不影响流水线，点击后若无 runner 会一直 pending）：
-#   build:macos       macOS DMG（产物自行上传包仓库；标签流水线上
-#                     运行时会自动追加为 Release 资产链接）
-#   build:ios         iOS 模拟器构建（未签名，仅证明可编译；安装真机
-#                     需 Xcode 配置开发者证书后重新签名）
-#
-# Android 签名（src-tauri/gen/android/app/build.gradle.kts 经环境变量读取）：
-#   默认每次构建临时生成密钥 —— 演示安装没问题，但覆盖安装需先卸载旧版。
-#   稳定签名：在 GitLab → Settings → CI/CD → Variables 配置：
-#     ANDROID_KEYSTORE_B64          keystore 文件内容（base64）
-#     ANDROID_KEYSTORE_PASSWORD     keystore 口令
-#     ANDROID_KEY_ALIAS             别名（缺省 release）
-#     ANDROID_KEYSTORE_KEY_PASSWORD 私钥口令（缺省同 keystore 口令）
-#
-# 本地复现（Android）：JAVA_HOME + ANDROID_HOME + NDK_HOME 就绪后
-#   `cargo tauri android build --apk --target aarch64 --target armv7`
 # ============================================================================
 
 workflow:
@@ -58,7 +40,6 @@ variables:
   RUST_BACKTRACE: "1"
   PKG_NAME: "mystery-novel-agent"
   WIN_TARGET: "x86_64-pc-windows-msvc"
-  ANDROID_NDK_VERSION: "26.3.11579264"
 
 # ---------------------------------------------------------------- CLI (Linux)
 build:linux-cli:
@@ -126,168 +107,6 @@ build:windows:
       - dist/
     expire_in: 1 week
 
-# ------------------------------------------------------ Android APK（自动）
-build:android:
-  stage: build
-  image: rust:1-bookworm
-  interruptible: true
-  timeout: 2h
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-    - if: '$CI_COMMIT_TAG =~ /^v/'
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-  variables:
-    ANDROID_HOME: "$CI_PROJECT_DIR/.android-sdk"
-    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle-home"
-  cache:
-    key: android-build-cache
-    paths:
-      - .android-sdk/
-      - .gradle-home/
-      - .cargo-home/registry/
-      - .cargo-home/git/
-      - .cargo-home/bin/
-      - frontend/.npm/
-  before_script:
-    - export PATH="$CARGO_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-    # JDK 17（gradle 8.14 要求）
-    - apt-get update -qq
-    - apt-get install -y -qq --no-install-recommends openjdk-17-jdk-headless unzip wget
-    - export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
-    # Android SDK cmdline-tools（缓存命中则跳过下载）
-    - |
-      if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-        mkdir -p "$ANDROID_HOME/cmdline-tools"
-        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-        unzip -q commandlinetools-linux-11076708_latest.zip -d "$ANDROID_HOME/cmdline-tools"
-        mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-      fi
-    # SDK 组件：compileSdk 36 / AGP 8.11 默认 build-tools 35（36 一并装上，双保险）
-    - yes | sdkmanager --licenses > /dev/null || true
-    - sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;35.0.0" "build-tools;36.0.0" "ndk;${ANDROID_NDK_VERSION}" > /dev/null
-    - export NDK_HOME="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
-    - rustup target add aarch64-linux-android armv7-linux-androideabi
-    - command -v cargo-tauri >/dev/null || cargo install --locked tauri-cli --version "^2"
-    # 签名密钥：优先用 CI 变量提供的稳定密钥；否则临时生成（覆盖安装需先卸载）
-    - |
-      if [ -n "$ANDROID_KEYSTORE_B64" ]; then
-        echo "$ANDROID_KEYSTORE_B64" | base64 -d > /tmp/ci.keystore
-        export KEYSTORE_FILE="/tmp/ci.keystore"
-        export KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:?配置了 ANDROID_KEYSTORE_B64 就必须同时配置 ANDROID_KEYSTORE_PASSWORD}"
-        export KEY_ALIAS="${ANDROID_KEY_ALIAS:-release}"
-        export KEY_PASSWORD="${ANDROID_KEYSTORE_KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
-      else
-        keytool -genkeypair -keystore /tmp/ci.keystore -storepass androidci -keypass androidci \
-          -alias release -keyalg RSA -keysize 2048 -validity 10950 \
-          -dname "CN=mystery-novel-agent, O=course, C=CN" > /dev/null 2>&1
-        export KEYSTORE_FILE="/tmp/ci.keystore" KEYSTORE_PASSWORD=androidci KEY_ALIAS=release KEY_PASSWORD=androidci
-        echo "提示：使用临时签名密钥（如需稳定签名见文件头注释配置 CI 变量）"
-      fi
-  script:
-    # 前端依赖（tauri 的 beforeBuildCommand 自动构建前端）
-    - cd frontend && npm ci --cache .npm --prefer-offline && cd ..
-    # gen/android 已随仓库分发；tauri CLI 每次构建再生 tauri.settings.gradle
-    # / tauri.properties / jniLibs 等被 gitignore 的文件
-    - cargo tauri android build --apk --target aarch64 --target armv7
-    - mkdir -p dist
-    # gradle 工程无 product flavor：产物在 outputs/apk/release/（防御性用 find 兜底）
-    - |
-      APK=$(find src-tauri/gen/android/app/build/outputs/apk -name "*-release.apk" -type f | head -n1)
-      if [ -z "$APK" ]; then echo "未找到构建产物 APK"; exit 1; fi
-      cp "$APK" dist/mystery-shelf-android-universal.apk
-  artifacts:
-    paths:
-      - dist/
-    expire_in: 1 week
-
-# ------------------------------------- macOS DMG（手动；需带 macos tag 的 runner）
-# 前置要求（runner 侧）：rustup、Node ≥ 18、Xcode Command Line Tools。
-# 产物自行上传 generic package registry；标签流水线上运行时自动追加
-# 为该 Release 的资产链接（release-cli 只由自动 job 创建，此处走链接 API）。
-build:macos:
-  stage: build
-  tags: ["macos"]
-  interruptible: true
-  timeout: 2h
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: manual
-    - if: '$CI_COMMIT_TAG =~ /^v/'
-      when: manual
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
-  allow_failure: true
-  before_script:
-    - export PATH="$CARGO_HOME/bin:$PATH"
-    - command -v cargo-tauri >/dev/null || cargo install --locked tauri-cli --version "^2"
-  script:
-    - cd frontend && npm ci && cd ..
-    - cargo tauri build --bundles dmg
-    - mkdir -p dist
-    - cp target/release/bundle/dmg/*.dmg "dist/mystery-shelf-macos-$(uname -m).dmg"
-    - |
-      VER="${CI_COMMIT_TAG:-continuous}"
-      cd dist
-      for f in *; do
-        URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/${VER}/${f}"
-        echo "上传 ${f} → ${PKG_NAME}/${VER}"
-        curl --fail --retry 3 --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" "$URL"
-        if [ -n "$CI_COMMIT_TAG" ]; then
-          curl --fail --retry 3 --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-            --data-urlencode "name=${f}" --data-urlencode "url=${URL}" \
-            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases/${CI_COMMIT_TAG}/assets/links"
-        fi
-      done
-  artifacts:
-    paths:
-      - dist/
-    expire_in: 1 week
-
-# ------------------- iOS 模拟器构建（手动；需 macOS runner + Xcode，未签名）
-# 未配置 Apple 开发者证书：产物为未签名 .app（仅模拟器可装），
-# 主要目的是验证 iOS 目标可编译。gen/apple 由 `ios init --ci` 现场生成。
-build:ios:
-  stage: build
-  tags: ["macos"]
-  interruptible: true
-  timeout: 2h
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: manual
-    - if: '$CI_COMMIT_TAG =~ /^v/'
-      when: manual
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
-  allow_failure: true
-  before_script:
-    - export PATH="$CARGO_HOME/bin:$PATH"
-    - rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim
-    - command -v cargo-tauri >/dev/null || cargo install --locked tauri-cli --version "^2"
-  script:
-    - cd frontend && npm ci && cd ..
-    - cargo tauri ios init --ci
-    # 直接调 xcodebuild 构建模拟器目标（绕过 tauri 的签名导出流程）；
-    # Rust 侧由工程内 build phase 驱动 tauri CLI 按当前平台自动交叉编译
-    - cd src-tauri/gen/apple
-    - SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/,""); print; exit}')
-    - echo "scheme=${SCHEME}"
-    - xcodebuild -scheme "$SCHEME" -configuration Release -sdk iphonesimulator -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-    - APP=$(find build/Build/Products -name "*.app" -type d | head -n1)
-    - if [ -z "$APP" ]; then echo "未找到 .app 产物"; exit 1; fi
-    - mkdir -p ../../../../dist
-    - ditto -c -k --keepParent "$APP" "../../../../dist/mystery-shelf-ios-simulator-$(uname -m).zip"
-    - |
-      VER="${CI_COMMIT_TAG:-continuous}"
-      cd ../../../../dist
-      for f in *; do
-        curl --fail --retry 3 --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/${VER}/${f}"
-      done
-  artifacts:
-    paths:
-      - dist/
-    expire_in: 1 week
-
 # --------------------- 滚动发布（默认分支 push → continuous 包 + 滚动 Release）
 # Release 页固定保留一个 tag=continuous 的条目：每次构建先删旧 Release/tag
 # 再以当前提交重建，资产链接指向包仓库 continuous 版本 —— 永远是最新构建。
@@ -298,8 +117,6 @@ publish:continuous:
     - job: build:linux-cli
       artifacts: true
     - job: build:windows
-      artifacts: true
-    - job: build:android
       artifacts: true
   rules:
     - if: $CI_PIPELINE_SOURCE == "web"
@@ -332,7 +149,7 @@ publish:continuous:
       curl -s -o /dev/null -w "  tag DELETE: HTTP %{http_code}\n" -X DELETE \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" "${API}/repository/tags/continuous" || true
       echo "创建 continuous Release…"
-      BODY="{\"tag_name\":\"continuous\",\"ref\":\"${CI_COMMIT_SHA}\",\"name\":\"Latest build (${CI_COMMIT_SHORT_SHA})\",\"description\":\"默认分支最新构建（每次 push 自动更新）。\\n\\n- Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）\\n- Android：mystery-shelf-android-universal.apk（arm64 + armv7）\\n- CLI：Linux / Windows\\n\\n正式版本见 v* 标签的 Release。\",\"assets\":{\"links\":${LINKS}}}"
+      BODY="{\"tag_name\":\"continuous\",\"ref\":\"${CI_COMMIT_SHA}\",\"name\":\"Latest build (${CI_COMMIT_SHORT_SHA})\",\"description\":\"默认分支最新构建（每次 push 自动更新）。\\n\\n- Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）\\n- CLI：Linux / Windows\\n\\nAndroid / macOS / iOS 产物在 GitHub Releases；正式版本见 v* 标签的 Release。\",\"assets\":{\"links\":${LINKS}}}"
       code=$(curl -s -o /tmp/rel.json -w "%{http_code}" -X POST \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
         --header "Content-Type: application/json" \
@@ -356,8 +173,6 @@ publish:release:
       artifacts: true
     - job: build:windows
       artifacts: true
-    - job: build:android
-      artifacts: true
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
   script:
@@ -378,5 +193,5 @@ publish:release:
       release-cli create \
         --name "Release ${CI_COMMIT_TAG}" \
         --tag-name "${CI_COMMIT_TAG}" \
-        --description "标签 ${CI_COMMIT_TAG} 的自动构建产物：Windows 安装包（NSIS）、Android APK（arm64 + armv7）、Linux / Windows CLI。" \
+        --description "标签 ${CI_COMMIT_TAG} 的自动构建产物：Windows 安装包（NSIS）+ Linux / Windows CLI。Android / macOS / iOS 产物见 GitHub Releases。" \
         $ASSET_ARGS
