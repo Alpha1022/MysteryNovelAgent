@@ -13,3 +13,6 @@ opencode.json
 
 # 课程展示课件（不随仓库分发）
 presentation/
+
+# 安全文件（不随仓库分发）
+.secure_files/
