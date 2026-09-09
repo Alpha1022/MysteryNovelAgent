@@ -73,6 +73,7 @@ src/
 
 ### LLM
 - OpenAI 兼容 `/chat/completions`；配置来源优先级：GUI 设置页（config.toml `llm` 段，**多 Provider**（各含 base_url/api_key/models）+ 默认服务商/模型）→ `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `MODEL_NAME` 环境变量；未配置返回 `None` 并降级。每次 LLM 调用的 token 用量按 "provider/model" 累计入 `llm_usage` 表。旧版单 provider 平铺 llm 配置在 `AppConfig::load` 自动迁移。
+- **预算与成本**：`llm.budget_tokens` 设定后，`agent::chat_with_tools_timeout`（所有 LLM 调用的统一咽喉）在每次调用前读取累计用量，达到预算即返回 `LlmError::Budget`（不可重试）——融合/翻译降级、书虫/对话报错；`reset_llm_usage` 清零用量（预算周期重置）。成本按 `llm.pricing`（元/百万 tokens，精确匹配）或内置预设价（前缀匹配）换算，设置页展示。
 - 请求体显式 `stream: false`；消息序列必须 system→user 开头（部分 API 拒绝 system→assistant）。
 
 ---

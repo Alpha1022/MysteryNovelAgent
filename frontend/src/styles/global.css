@@ -943,7 +943,8 @@ a {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  /* 85：高于书虫悬浮窗(80)，低于拖拽遮罩(90) —— 书虫弹出的确认/编辑窗口须盖住聊天面板 */
+  z-index: 85;
   background: rgba(8, 10, 14, 0.72);
   backdrop-filter: blur(3px);
   display: flex;
@@ -2735,6 +2736,101 @@ a {
 
 .usage-table td.total {
   color: var(--accent);
+}
+
+/* 用量合计行 / 预算进度 / 价格编辑 */
+.usage-total-row td {
+  border-top: 1px solid var(--border-soft);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.usage-total-row td.total {
+  color: var(--accent);
+}
+
+.usage-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.budget-bar {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.budget-text {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.budget-exceeded {
+  color: #e07a5f;
+  font-weight: 600;
+}
+
+.budget-hint {
+  margin-top: 6px;
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.progress-bar.batch {
+  margin-top: 8px;
+}
+
+.progress-fill.over {
+  background: #e07a5f;
+}
+
+.pricing-table input {
+  width: 90px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.pricing-table input:focus {
+  outline: none;
+  border-color: rgba(201, 168, 106, 0.6);
+}
+
+/* 返回顶部 / 回原位浮动按钮（书虫入口上方） */
+.back-top-btn {
+  position: fixed;
+  right: 24px;
+  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+  z-index: 80;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--border-soft);
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.back-top-btn:hover {
+  border-color: rgba(201, 168, 106, 0.65);
+  transform: translateY(-2px);
 }
 
 /* ============ 状态徽章切换 ============ */

@@ -65,6 +65,48 @@ pub struct LlmProvider {
 /// LLM 调用失败默认重试次数
 pub const DEFAULT_LLM_RETRY: u32 = 2;
 
+/// 模型价格（元 / 百万 tokens，输入与输出分开计价）
+///
+/// `model` 支持前缀匹配（如 "gpt-4o" 命中 "gpt-4o-2024-08-06"）；
+/// 显式配置（`[[llm.pricing]]`）精确匹配优先于本预设表。
+/// 预设价格为撰写时公开牌价的近似值，仅供参考 —— 成本预估以用户设置为准。
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct ModelPricing {
+  #[serde(default)]
+  pub model: String,
+  /// 输入价格（元 / 百万 tokens）
+  #[serde(default)]
+  pub input_per_m: f64,
+  /// 输出价格（元 / 百万 tokens）
+  #[serde(default)]
+  pub output_per_m: f64,
+}
+
+/// 内置参考价目表（元 / 百万 tokens，前缀匹配取最长命中）
+pub const PRESET_PRICING: &[(&str, f64, f64)] = &[
+  // DeepSeek
+  ("deepseek-chat", 2.0, 8.0),
+  ("deepseek-reasoner", 4.0, 16.0),
+  // OpenAI
+  ("gpt-4o-mini", 1.1, 4.3),
+  ("gpt-4o", 18.0, 72.0),
+  ("gpt-4.1-nano", 0.8, 3.2),
+  ("gpt-4.1-mini", 2.9, 11.6),
+  ("gpt-4.1", 14.4, 57.6),
+  ("o4-mini", 8.0, 32.0),
+  ("gpt-3.5-turbo", 3.0, 6.0),
+  // Anthropic
+  ("claude-haiku", 5.4, 27.0),
+  ("claude-sonnet", 21.6, 108.0),
+  ("claude-opus", 108.0, 540.0),
+  // 通义千问
+  ("qwen-turbo", 0.3, 0.6),
+  ("qwen-plus", 0.8, 2.0),
+  ("qwen-max", 2.4, 9.6),
+  // 智谱
+  ("glm-4.5", 0.6, 2.2),
+];
+
 /// LLM 设置（GUI 设置页配置，持久化到 config.toml 的 `llm` 段，优先于环境变量）
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct LlmSettings {
@@ -80,6 +122,12 @@ pub struct LlmSettings {
   /// LLM 调用失败重试次数（None = 默认 2 次；0 = 不重试，最大 10）
   #[serde(default)]
   pub retry_count: Option<u32>,
+  /// Token 预算（累计 total_tokens 达到预算后拒绝新的 LLM 调用；None = 不限）
+  #[serde(default)]
+  pub budget_tokens: Option<i64>,
+  /// 模型价格表（元 / 百万 tokens；精确匹配优先于内置预设）
+  #[serde(default)]
+  pub pricing: Vec<ModelPricing>,
 
   // ---- 旧版单 provider 平铺字段：仅用于读取旧 config.toml 迁移，保存时清除 ----
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +142,38 @@ pub struct LlmSettings {
 impl LlmSettings {
   pub fn has_providers(&self) -> bool {
     self.providers.iter().any(|p| !p.api_key.trim().is_empty())
+  }
+
+  /// 解析模型价格：显式配置精确匹配 → 内置预设最长前缀匹配
+  ///
+  /// `model` 兼容用量统计键（"provider/model"）与裸模型名两种形式，
+  /// 返回 (输入价格, 输出价格) 元 / 百万 tokens；无匹配返回 None（不计成本）。
+  pub fn price_for(&self, model: &str) -> Option<(f64, f64)> {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    if let Some(p) = self.pricing.iter().find(|p| p.model == bare) {
+      return Some((p.input_per_m, p.output_per_m));
+    }
+    PRESET_PRICING
+      .iter()
+      .filter(|(k, _, _)| bare.starts_with(k))
+      .max_by_key(|(k, _, _)| k.len())
+      .map(|(_, i, o)| (*i, *o))
+  }
+
+  /// 预算检查（纯函数）：累计用量达到预算时返回错误信息
+  pub fn budget_error(&self, used_total: i64) -> Option<String> {
+    let budget = self.budget_tokens?;
+    if budget <= 0 {
+      return None;
+    }
+    if used_total >= budget {
+      Some(format!(
+        "已达 token 预算上限（累计 {used_total} / 预算 {budget}）。\
+         可在「设置 → LLM」调整预算或清零用量后重试"
+      ))
+    } else {
+      None
+    }
   }
 }
 

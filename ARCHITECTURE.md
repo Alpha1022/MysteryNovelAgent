@@ -86,10 +86,10 @@ GUI 另有：拖拽/批量导入、书虫 Agent（检索本地书库的对话助
 | `main.rs` | 265 | clap 命令路由；`run_add`（单本/文件夹批量循环）；`auto_render_shelf`（导入后自动重渲染静态书架）；`collect_epubs` 递归收集 |
 | `ingestion.rs` | 2645 | 【核心】导入流水线。CLI 入口 `ingest_book`（交互式）；GUI 入口 `analyze_epub`（静默匹配）/ `search_clasp_page`（分页搜索）/ `prepare_import`（可打断预处理）/ `finalize_import`（落盘）/ `persist_import`（入库）；`sanitize_epub_if_needed`（损坏 EPUB 修复：zip 重复条目走中央目录重建、OPF manifest 去重/坏引用剔除）；`inherit_series`（系列继承规则，CLI/GUI/来源重设共用）；`crawled_title_author`（爬取优先回填）；`pick_silent_match`（静默匹配：唯一结果或繁简归一后精确同名） |
 | `spider.rs` | 878 | claspclub 三接口客户端（建议/分页/详情，结构体集中定义）；豆瓣短评解析（`li.comment-item`，评分 allstarXX/10、内容、有用数，全部有兜底选择器）；`filter_comments`（≥15 汉字 + 有用数降序 top5，不足放宽取最长 5 条）；`parse_douban_description`（`#link-report` 内 `span.all` 完整版优先 / `span.short` 兜底，限定内容简介区避免串到作者简介区）；`parse_douban_book_meta`（og:title / #info 作者 / og:image）；`fetch_clasp_reviews`（claspclub 评论接口，防御式字段兼容） |
-| `agent.rs` | 421 | LLM 客户端：`resolve_config`（多 Provider 优先级解析，见 §7）；`chat` / `chat_with_tools`（重试 + 超时）；`combine_descriptions`（多来源简介融合，带降级原因返回）；`TokenUsage`/`ChatOutcome` |
+| `agent.rs` | 476 | LLM 客户端：`resolve_config`（多 Provider 优先级解析，见 §7）；`chat` / `chat_with_tools`（重试 + 超时）；`combine_descriptions`（多来源简介融合，带降级原因返回）；`TokenUsage`/`ChatOutcome` |
 | `finish.rs` | 227 | 苏格拉底式书评：选书 → 立即标记已读 → 组装上下文（元数据 + top5 短评）→ 多轮对话（`/done` 生成书评、`/skip` 手动）→ 书评入库（`my_review` + 个人短评） |
-| `db.rs` | 1713 | 全部表结构与幂等迁移；封面引用计数（`cover_ref_add/release/seed`，归零才允许删文件）；`replace_library_from_remote`（WebDav 拉取的整库覆盖，含 VACUUM INTO 快照）；`get_book_cards`（书架分页查询，含搜索/多书库过滤）；sources 表全套 CRUD 与 `sync_book_source_columns`（books 冗余列回写） |
-| `config.rs` | 362 | `AppConfig`（config.toml 读写）：多书库（含主题/默认标签/WebDav 凭据）、多 Provider LLM 段（旧单 Provider 平铺配置自动迁移）、`covers_dir`、`temp_dir`（移动端经 `set_data_dir_override` 重定向到应用私有目录） |
+| `db.rs` | 1737 | 全部表结构与幂等迁移；封面引用计数（`cover_ref_add/release/seed`，归零才允许删文件）；`replace_library_from_remote`（WebDav 拉取的整库覆盖，含 VACUUM INTO 快照）；`get_book_cards`（书架分页查询，含搜索/多书库过滤）；sources 表全套 CRUD 与 `sync_book_source_columns`（books 冗余列回写） |
+| `config.rs` | 438 | `AppConfig`（config.toml 读写）：多书库（含主题/默认标签/WebDav 凭据）、多 Provider LLM 段（旧单 Provider 平铺配置自动迁移）、`covers_dir`、`temp_dir`（移动端经 `set_data_dir_override` 重定向到应用私有目录） |
 | `library.rs` | 111 | `slugify` 拼音命名（`[系列拼音-N] 作者拼音-书名拼音.epub`，仅 `[a-z0-9-]`，冲突 `-2`）；`copy_into_library`（复制 + resolve_collision）；`to_ascii_filename` |
 | `device.rs` | 150 | `sysinfo::Disks` 枚举可移动盘（Win 盘符 / Linux `/media` / macOS `/Volumes`）；识别 Kindle（`documents/`+`system/`）、Kobo（`.kobo/`）、通用 USB；MultiSelect 选书复制 `library_file` |
 | `webdav.rs` | 974 | WebDav 客户端（reqwest 手发 MKCOL/PROPFIND/PUT/DELETE）；`push`（本地覆盖云端）与 `pull`（云端覆盖本地）的整库算法，见 §12 |
@@ -226,8 +226,10 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 3. 都没有 → 返回 `None`，调用方走降级路径（**调用前先探测，绝不因未配置而失败**）。
 
 **调用策略**：
-- 超时 30s；重试次数取 `llm.retry_count`（默认 2，最大 10），**只对可重试错误**（网络错误 / HTTP 429 / 5xx）指数退避 —— 参数错误、鉴权失败重试无意义；
-- 每次调用产出 `TokenUsage`，按 `"provider/model"` 主键 UPSERT 累计入 `llm_usage`（GUI 设置页可见成本）；
+- 超时 30s；重试次数取 `llm.retry_count`（默认 2，最大 10），**只对可重试错误**（网络错误 / HTTP 429 / 5xx）指数退避 —— 参数错误、鉴权失败、预算超限重试无意义；
+- **预算咽喉**：`chat_with_tools_timeout` 是所有 LLM 调用（chat/融合/翻译/书虫循环）的唯一入口，每次调用前读 `llm.budget_tokens` 与 `llm_usage` 累计用量，达到预算立即返回 `LlmError::Budget`（不可重试；用量按次入库，多轮 agent 每轮都会重新检查 → 达到预算自动中断）。DB 读失败按 0 用量放行（统计故障不阻断功能）；
+- 每次调用产出 `TokenUsage`（输入/输出/总量取自 API 响应的 `usage` 字段），按 `"provider/model"` 主键 UPSERT 累计入 `llm_usage`（GUI 设置页可见用量与成本）；
+- **成本换算**：`LlmSettings::price_for` 按 "显式配置（`[[llm.pricing]]`，元/百万 tokens）精确匹配 → 内置预设表 `PRESET_PRICING` 最长前缀匹配" 解析价格；成本 = 输入量×输入价 + 输出量×输出价，设置页逐模型与合计展示；`reset_llm_usage` 清零用量（预算周期重置）；
 - 带工具调用（`chat_with_tools`，书虫用）与不带工具两个入口。
 
 **LLM 只在三个业务点出现**（其余全部确定性代码）：
@@ -240,13 +242,19 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 `chatbot_chat` 命令 —— 一个小型 function-calling agent：
 
 - **系统提示按数据库实时构建**：注入当前书库标题 + 前 40 本书的元数据摘要（含豆瓣短评精选）+ 工具使用指引，其余让模型用工具按需检索（提示词明确要求"不要凭空猜测"）；
-- **四个本地工具**（`chatbot_tools()`，OpenAI function calling 格式）：
+- **读工具**（`chatbot_tools()`，OpenAI function calling 格式）：
   - `search_books(keyword)`：标题/作者/标签模糊检索；
   - `filter_books(status/author/tag)`：按条件过滤；
   - `get_book_detail(book_id)`：完整简介/个人书评/系列/状态；
-  - `get_book_comments(book_id)`：这本书的短评列表。
+  - `get_book_comments(book_id)`：这本书的短评列表；
+  - `search_claspclub(keyword, page?)`：**在线书目库检索**（网络调用）—— 复用 `ingestion::search_clasp_page`（同款反爬 HTTP 客户端），返回书名/作者/标签/无剧透简介；结果显式标注"在线书目库（非本地书架）"并指引模型改用 search_books 查本地，避免线上信息与本地藏书混淆。**不持数据库锁**（工具循环逐工具短暂持锁，网络 IO 在锁外执行）。
   工具执行即普通 SQL 查询（`db::search_chatbot_books`），结果以 JSON 字符串回给模型；
-- **循环**：最多 `CHATBOT_MAX_ROUNDS=5` 轮工具调用；LLM 超时 120s（长推理链）；
+- **写工具**（用户确认后才生效，见下）：
+  - `update_book_meta(book_id, title?, author?, tags?, description?, series_name?, series_order?)`：修改元数据；
+  - `set_book_status(book_id, status, review?, generate_review?)`：切换阅读状态；已读可携带交流总结出的短评或请求打开 AI 引导式短评窗口（`review` 与 `generate_review` 互斥，仅已读有效）；
+  - `merge_books(book_ids[])`：按顺序合并为合集（≥2 本）。
+  **后端不直接执行写操作**：`execute_chatbot_tool` 仅做参数校验（书存在 / 状态白名单 / ≥2 本）并返回 `pending_confirmation` 标记；前端 `Chatbot.tsx` 从最终回复的 `steps` 轨迹中解析出待确认动作（`collectActions`，按动作去重排队），逐个弹出与主界面**同一套组件**的确认/编辑窗口 —— `EditMetaModal`（书虫补丁预填到当前值上）、`ConfirmDialog`（状态/短评/合并确认，合并后沿用"是否 LLM 融合简介"固定流程）、`ReviewModal`（苏格拉底短评）—— 用户确认后走既有命令（`update_book_meta`/`set_book_status`/`save_book_review`/`merge_books_gui`）生效并广播 `mna:library-refresh` 事件刷新书架。系统提示要求模型调用写工具后告知用户"请在弹出窗口中确认"，不得声称已完成；
+- **循环**：最多 `CHATBOT_MAX_ROUNDS=5` 轮工具调用；LLM 超时 120s（长推理链）；预算耗尽会在下一轮调用前被预算咽喉拦截；
 - **可审计**：回复携带 `steps`（工具名 + 实参 + 结果摘要），前端以可折叠记录展示 —— **每执行完一个工具就推送 `chat-progress` 事件**，生成期间实时展示调用轨迹而非只放动画；
 - 降级：未配置 LLM → 命令直接报错（GUI 不显示入口）。
 
@@ -291,7 +299,7 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 
 ## 14. GUI（Tauri 2 + React）
 
-### 14.1 命令层（src-tauri/src/commands.rs，3188 行，全部 #[tauri::command]）
+### 14.1 命令层（src-tauri/src/commands.rs，3514 行，全部 #[tauri::command]）
 
 分组速览：查询（`get_books`/`get_book_detail`/`get_comments`/`get_config`/`get_settings`/`llm_status`）、导入（`analyze_epub`/`search_clasp`/`import_epub`/`prepare_import`/`commit_import`/`set_pending_cover`/`discard_import`/`cancel_task`/`collect_epubs`/`save_dropped_file`/`debug_log`）、书籍维护（`delete_book`/`update_book_meta`/`upload_cover`/`set_book_status`/`save_book_review`/`reset_book_tags`/`reset_book_series`）、来源管理（`list_sources`/`add_clasp_sources`/`add_douban_sources`/`save_source_order`/`delete_source`/`clear_sources`/`refresh_source_comments`/`refresh_source_meta`/`set_source_as_cover`/`set_source_as_description`/`merge_source_descriptions`）、阅读（`get_reader_content`/`open_book_file`）、封面（`fetch_cover_image`/`read_cover_file`/`fetch_epub_cover`）、AI（`llm_chat`/`chatbot_chat`/`translate_text`）、WebDav 四命令、书库 CRUD 五命令、移动端文件浏览器（`is_mobile`/`fs_roots`/`list_fs_dir`/`create_fs_dir`）、`write_text_file`/`read_text_file`。
 
@@ -312,7 +320,8 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 | `delete_book` | 删除 DB 记录 + 书库 EPUB 副本 + 封面缓存（封面按引用计数，归零才删文件；原始导入文件不动） | 前端原生确认框 |
 | `update_book_meta` | 详情页编辑书名/作者/标签/简介，同步 EPUB 副本 | EPUB 写入失败仅降级更新 DB |
 | `upload_cover` | 手动封面替换：复制入 covers → 同步 EPUB 副本嵌入封面 → 更新 DB | EPUB 写入失败仅降级更新 DB |
-| `get_settings` / `save_settings` | LLM 多 Provider（各含 Endpoint / API Key / 模型）+ 默认服务商/模型 + token 用量 | 旧版单 provider 平铺配置自动迁移；名称去重校验 |
+| `get_settings` / `save_settings` | LLM 多 Provider（各含 Endpoint / API Key / 模型）+ 默认服务商/模型 + token 预算 + 模型价格表 + 用量与预估成本（逐模型 + 合计；`pricing_effective` 为"显式配置→内置预设"解析后的展示值） | 旧版单 provider 平铺配置自动迁移；名称去重校验；价格为非负数、按模型去重 |
+| `reset_llm_usage` | 清零 `llm_usage` 用量统计（预算周期重置；不影响书籍数据） | 前端确认框 |
 | `llm_status` | LLM 可用性预检（合并本简介导入前提示） | 未配置返回 configured=false |
 | `set_book_status` | 切换阅读状态（想读/在读/已读，已读自动记录完成时间） | 状态值白名单校验 |
 | `llm_chat` | 通用 LLM 对话（GUI AI 书评会话）；用量按 "provider/model" 入库 | 消息序列必须 system 开头 |
@@ -334,9 +343,9 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 
 **导入交互细节**：加书弹窗承担交互确认职责 —— 书名/作者/标签可编辑（每字段带"翻译为中文"按钮，走 LLM）、展示封面、系列字段在确认步落库；无/多结果时进入搜索页（可改关键词、分页浏览、**按顺序多选 = 合并本**）；非中文书名必须确认后才可导入。「批量加书」为分裂按钮（点击选文件夹递归扫描，箭头/悬浮展开菜单），「唯一结果自动导入」开关在下拉菜单内（与 CLI batch 语义一致）。弹窗不启用"点击外部关闭"（避免拖拽选择文本时鼠标释放到蒙层误关）。
 
-**书架交互细节**：视图三态（网格/列表=封面左信息右/仅封面）+ 封面大小三档（大/中/小，窄屏默认小），localStorage 持久化；排序（添加顺序/最近/书名/作者/系列，中文经 `Intl.Collator` 拼音序）；侧栏筛选（阅读状态/作者/标签，多作者按顿号拆分 facet）；多选批量操作（设状态/删除/合并模式=有序选择后合并）；阅读状态徽章可点击切换，切到"已读"弹短评询问（可与 AI 多轮讨论后生成）。
+**书架交互细节**：视图三态（网格/列表=封面左信息右/仅封面）+ 封面大小三档（大/中/小，窄屏默认小），localStorage 持久化；排序（添加顺序/最近/书名/作者/系列，中文经 `Intl.Collator` 拼音序）；侧栏筛选（阅读状态/作者/标签，多作者按顿号拆分 facet）；多选批量操作（设状态/删除/合并模式=有序选择后合并）；阅读状态徽章可点击切换，切到"已读"弹短评询问（可与 AI 多轮讨论后生成）；**返回顶部浮动按钮**（滚离顶部显示 ↑，点击平滑回顶后变 ↓ 可返回原位，用户再次下滑自动重置 —— 下滑判定用滚动增量方向而非绝对位置，避免回顶动画误触发）；监听 `mna:library-refresh` CustomEvent 刷新书架（书虫写操作完成后广播）。
 
-**设置页**：书库（多书库 CRUD/切换/主题色/默认标签/路径迁移）/ LLM（多 Provider + 默认服务商/模型 + 重试次数 + token 用量表）/ WebDav（按书库独立开关与凭据、远端位置预览 `{remote_dir}/{书库名}`、测试连接/保存/推送/拉取，同步前自动保存配置）。
+**设置页**：书库（多书库 CRUD/切换/主题色/默认标签/路径迁移）/ LLM（多 Provider + 默认服务商/模型 + 重试次数 + **token 预算与进度条 + 模型价格表编辑 + 用量/成本统计（逐模型与合计，"清零用量"重置预算周期）**）/ WebDav（按书库独立开关与凭据、远端位置预览 `{remote_dir}/{书库名}`、测试连接/保存/推送/拉取，同步前自动保存配置）。
 
 **书虫 Chatbot**：回复经轻量 Markdown 渲染（`utils/markdown.ts`，先转义再转换防注入）；assistant 消息携带工具调用轨迹（可折叠查看实参与结果摘要）；多会话管理（localStorage `mna-chat-sessions`），会话可导出/导入完整上下文 JSON。
 
@@ -403,7 +412,7 @@ Rust 核心库直接被复用（同一 crate 作为 path 依赖）；体积与�
 
 ## 17. 测试策略
 
-`cargo test` 44 个单元测试全绿，**按"不变量"而非"覆盖率"组织**：
+`cargo test` 49 个单元测试全绿（核心库 47 + GUI crate 2），**按"不变量"而非"覆盖率"组织**：
 
 | 领域 | 测试 | 守住的不变量 |
 | :--- | :--- | :--- |
@@ -412,7 +421,8 @@ Rust 核心库直接被复用（同一 crate 作为 path 依赖）；体积与�
 | EPUB 修复 | `fix_opf_broken_href`、`dedupe_opf_manifest`、`epub_cover_fallback` | 损坏 zip/OPF 自动重建 |
 | 命名 | `slugify`、`filename` | 拼音命名规范与冲突处理 |
 | 数据库 | `cover_ref_lifecycle`、`replace_library_from_remote`、`vacuum_into_snapshot`、`match_urls_and_douban_comments`、`record_llm_usage`、`set_book_status`、`rebase_cover_path_cross_platform` | 封面引用计数；WebDav 整库覆盖；用量记账；状态白名单 |
-| LLM 配置 | `resolve_settings_priority`、`resolve_env_fallback`、`resolve_model_fallback`、`resolve_skip_empty_key` | 多 Provider 解析优先级与环境变量兜底 |
+| LLM 配置 | `resolve_settings_priority`、`resolve_env_fallback`、`resolve_model_fallback`、`resolve_skip_empty_key`、`budget_error`、`budget_error_not_retryable`、`price_for` | 多 Provider 解析优先级与环境变量兜底；预算边界（达到/超过/未配置）；价格解析（显式覆盖 > 预设最长前缀） |
+| 书虫写工具 | `chatbot_action_tools_pending_confirmation`、`format_clasp_results`（GUI crate） | 写工具仅校验并返回待确认标记，不直接执行；状态白名单 / review 互斥 / 合并 ≥2 本等参数校验；在线检索回包的来源标注 / fuzzy 标记 / 简介截断 |
 | 其他 | `reader::sanitize_and_inline`、`resolve_ref`、`base64_encode`、`shelf::render_shelf`、`webdav` 四个、`utils` 三个 | 阅读器消毒/路径归一；WebDav URL 编码；中文工具 |
 
 验证链：`cargo build`（零 error）→ `cargo test`（全绿）→ `cargo run -- --help`（CLI 结构）→ `npm run build`（tsc + vite）→ 手动冒烟（拖拽导入/书架/详情）。GUI 侧新增逻辑（拖拽字节流、滚动持久化）通过注入探针（`debug_log` 命令 + app.log）在真实运行的应用中实证过端到端路径。
@@ -451,9 +461,12 @@ username = "…"; password = "…"    # 应用专用密码；remote_dir = "myste
 
 [llm]                            # GUI 设置页写入；优先于 OPENAI_* 环境变量
 default_provider = "DeepSeek"; default_model = "deepseek-chat"; retry_count = 2
+budget_tokens = 5000000          # Token 预算：累计用量达到后拒绝新的 LLM 调用（缺省不限）
 [[llm.providers]]
 name = "DeepSeek"; base_url = "https://api.deepseek.com/v1"
 api_key = "sk-…"; models = ["deepseek-chat"]
+[[llm.pricing]]                  # 模型价格（元 / 百万 tokens；未配置的模型按内置预设表估算）
+model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 ```
 
 数据库默认 `%APPDATA%\mystery-novel-agent\mystery_novel.db`（CLI/GUI 共用）；`library_path`/`covers_path`/`database_path` 为旧版单书库字段（已迁移进 libraries）。GUI 日志双写 stdout 与数据目录 `app.log`（release 下 stdout 不可见，文件用于事后诊断）。
@@ -467,3 +480,14 @@ api_key = "sk-…"; models = ["deepseek-chat"]
 - **前端改动与嵌入**：dist 资产经 `generate_context!` 宏嵌入，修改前端后要经 tauri CLI 重新构建；怀疑嵌入过期时 `cargo clean -p mystery-gui` 强制重编译。
 - **Android**：见 §15。
 - **诊断**：GUI 的 Rust 侧 `tracing` 日志 → `app.log`；前端可 `invoke('debug_log', {msg})` 转发；`RUST_LOG` 覆盖级别。
+
+### 20.1 CI 自动构建与发布（`.gitlab-ci.yml`）
+
+仓库 remote 为 GitLab（git.tsinghua.edu.cn），CI 走 GitLab（GitHub Actions 不会在此 remote 运行）：
+
+- **触发**：默认分支每次 push / 手动触发 → 滚动构建；推 `v*` 标签 → 正式 Release。
+- **build:linux-cli**：Linux runner 原生构建 CLI（`cargo build --release -p mystery-novel-agent`）。
+- **build:windows**：Linux 上经 **cargo-xwin 交叉编译**（tauri 官方跨平台方案 `cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`，需 clang/llvm + nsis + node）→ NSIS 安装包 + Windows CLI exe；产物统一 ASCII 命名。
+- **publish:continuous**：产物上传 generic package registry 的 `continuous` 版本（同名覆盖、永远最新，入口 Deploy → Package Registry）。
+- **publish:release**：标签时上传版本化产物并以 `release-cli` 创建 Release（assets 指向 package registry 链接）。
+- 缓存只含 cargo registry / xwin SDK 缓存 / npm（target 数 GB 不缓存，全量编译约 20–40 分钟）。

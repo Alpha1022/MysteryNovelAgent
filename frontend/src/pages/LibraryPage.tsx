@@ -352,6 +352,47 @@ export default function LibraryPage() {
     }
   }, [filteredBooks, sortKey]);
 
+  // 书虫等外部入口修改数据后的书架刷新（CustomEvent 广播）
+  useEffect(() => {
+    const h = () => setRefresh((k) => k + 1);
+    window.addEventListener("mna:library-refresh", h);
+    return () => window.removeEventListener("mna:library-refresh", h);
+  }, []);
+
+  // 返回顶部 / 回原位浮动按钮：不在顶部时显示（↑）；
+  // 点击回顶后保持显示并变为（↓）用于返回原位；用户再次下滑后重置为 ↑。
+  // 下滑判定用增量方向而非绝对位置：程序化平滑滚动（回顶动画）不会误触发重置。
+  const [btVisible, setBtVisible] = useState(false);
+  const [btMode, setBtMode] = useState<"up" | "down">("up");
+  const btPrevRef = useRef(0);
+  const btLastYRef = useRef(0);
+
+  useEffect(() => {
+    const onScroll = () => {
+      const y = window.scrollY;
+      const movingDown = y > btLastYRef.current + 2;
+      btLastYRef.current = y;
+      setBtVisible(y > 240);
+      if (movingDown && y > 80) {
+        setBtMode((m) => (m === "down" ? "up" : m));
+      }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const onBackTopClick = () => {
+    if (btMode === "up") {
+      btPrevRef.current = window.scrollY;
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      setBtMode("down");
+      setBtVisible(true); // 回到顶部后仍显示（↓），供返回原位
+    } else {
+      window.scrollTo({ top: btPrevRef.current, behavior: "smooth" });
+      setBtMode("up");
+    }
+  };
+
   // 搜索防抖 300ms
   useEffect(() => {
     const t = setTimeout(() => setDebounced(query.trim()), 300);
@@ -1416,6 +1457,16 @@ export default function LibraryPage() {
             <div>松开以导入 EPUB 文件 / 文件夹</div>
           </div>
         </div>
+      )}
+
+      {(btVisible || btMode === "down") && (
+        <button
+          className="back-top-btn"
+          onClick={onBackTopClick}
+          title={btMode === "up" ? "返回顶部" : "返回刚才的位置"}
+        >
+          {btMode === "up" ? "↑" : "↓"}
+        </button>
       )}
     </div>
   );

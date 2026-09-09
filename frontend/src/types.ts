@@ -239,6 +239,13 @@ export interface LlmProvider {
   models: string[];
 }
 
+/** 模型价格（元 / 百万 tokens；输入与输出分开计价） */
+export interface ModelPricing {
+  model: string;
+  input_per_m: number;
+  output_per_m: number;
+}
+
 /** LLM 设置（config.toml llm 段，多 Provider） */
 export interface LlmSettings {
   providers: LlmProvider[];
@@ -246,6 +253,10 @@ export interface LlmSettings {
   default_model: string | null;
   /** 调用失败重试次数（null = 默认 2；0 = 不重试） */
   retry_count: number | null;
+  /** Token 预算（累计用量达到后拒绝新的 LLM 调用；null = 不限） */
+  budget_tokens: number | null;
+  /** 模型价格表（元 / 百万 tokens） */
+  pricing: ModelPricing[];
 }
 
 /** task-progress 事件负载（长任务实时进度） */
@@ -289,7 +300,7 @@ export interface ChatSession {
   messages: ChatMessage[];
 }
 
-/** 单个模型的 token 用量统计 */
+/** 单个模型的 token 用量统计（含按价格表换算的预估成本） */
 export interface LlmUsageRow {
   model: string;
   calls: number;
@@ -297,10 +308,18 @@ export interface LlmUsageRow {
   completion_tokens: number;
   total_tokens: number;
   last_used: string | null;
+  /** 预估成本（元；模型无价格配置时为 null） */
+  cost: number | null;
 }
 
 /** get_settings 返回 */
 export interface SettingsInfo {
   llm: LlmSettings;
   usage: LlmUsageRow[];
+  /** 全模型累计 token 总量 */
+  usage_total_tokens: number;
+  /** 全模型累计预估成本（元；任一模型缺价格时为 null） */
+  usage_total_cost: number | null;
+  /** 生效价格表（显式配置 → 内置预设；编辑器预填展示用） */
+  pricing_effective: ModelPricing[];
 }

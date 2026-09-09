@@ -252,6 +252,11 @@ export function saveSettings(llm: LlmSettings): Promise<void> {
   return invoke("save_settings", { settings: llm });
 }
 
+/** 清零 token 用量统计（预算周期重置） */
+export function resetLlmUsage(): Promise<void> {
+  return invoke("reset_llm_usage");
+}
+
 /** LLM 可用性预检（加书弹窗合并简介提示用） */
 export function llmStatus(): Promise<LlmStatus> {
   return invoke("llm_status");

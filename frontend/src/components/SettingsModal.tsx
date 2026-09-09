@@ -7,6 +7,7 @@ import {
   deleteLibrary,
   getConfig,
   getSettings,
+  resetLlmUsage,
   saveLibrary,
   saveSettings,
   switchLibrary,
@@ -18,6 +19,7 @@ import type {
   LibraryProfile,
   LlmProvider,
   LlmUsageRow,
+  ModelPricing,
   TaskProgressEvent,
   WebDavCfg,
   WebDavReport,
@@ -35,12 +37,24 @@ type Tab = "library" | "llm" | "webdav";
 
 /** 配置弹窗：左侧 书库 / LLM 选项卡；各组内多个条目以并列子选项卡切换 */
 export default function SettingsModal({ onClose }: { onClose: () => void }) {
+  const { confirm, confirmElement } = useConfirm();
   const [tab, setTab] = useState<Tab>("library");
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [defaultProvider, setDefaultProvider] = useState<string | null>(null);
   const [defaultModel, setDefaultModel] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState<number | null>(2);
+  const [budgetTokens, setBudgetTokens] = useState<number | null>(null);
   const [usage, setUsage] = useState<LlmUsageRow[]>([]);
+  const [usageTotalTokens, setUsageTotalTokens] = useState(0);
+  const [usageTotalCost, setUsageTotalCost] = useState<number | null>(null);
+  /**
+   * 价格编辑表（model → 输入/输出价）。
+   * 显式配置（pricing）优先展示；未配置的行展示后端解析的生效价
+   * （内置预设）——用户首次编辑时以生效价为底写入显式配置，
+   * 避免只改一项把另一项清零。
+   */
+  const [pricing, setPricing] = useState<ModelPricing[]>([]);
+  const [pricingEffective, setPricingEffective] = useState<ModelPricing[]>([]);
   const [libraries, setLibraries] = useState<LibDraft[]>([]);
   const [drafts, setDrafts] = useState<Record<string, LibDraft>>({});
   const [currentLib, setCurrentLib] = useState<string | null>(null);
@@ -49,6 +63,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [libError, setLibError] = useState<string | null>(null);
+  const [resettingUsage, setResettingUsage] = useState(false);
 
   // 子选项卡选中项
   const [libSelId, setLibSelId] = useState<string | null>(null);
@@ -65,7 +80,12 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
         setDefaultProvider(s.llm.default_provider);
         setDefaultModel(s.llm.default_model);
         setRetryCount(s.llm.retry_count ?? 2);
+        setBudgetTokens(s.llm.budget_tokens);
         setUsage(s.usage);
+        setUsageTotalTokens(s.usage_total_tokens);
+        setUsageTotalCost(s.usage_total_cost);
+        setPricing(s.llm.pricing);
+        setPricingEffective(s.pricing_effective);
         setLibraries(cfg.libraries);
         setCurrentLib(cfg.current_library);
         setLibSelId(cfg.current_library ?? cfg.libraries[0]?.id ?? null);
@@ -78,6 +98,18 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
       cancelled = true;
     };
   }, []);
+
+  /** 重新拉取用量统计（清零后刷新展示） */
+  const reloadUsage = async () => {
+    try {
+      const s = await getSettings();
+      setUsage(s.usage);
+      setUsageTotalTokens(s.usage_total_tokens);
+      setUsageTotalCost(s.usage_total_cost);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const updateProvider = (idx: number, patch: Partial<LlmProvider>) => {
     setProviders((prev) =>
@@ -145,6 +177,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
         default_provider: defaultProvider,
         default_model: defaultModel,
         retry_count: retryCount,
+        budget_tokens: budgetTokens,
+        pricing,
       });
       setSaved(true);
     } catch (e) {
@@ -153,6 +187,70 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
       setSaving(false);
     }
   };
+
+  /** 清零用量统计（确认后执行；不影响书籍数据） */
+  const onResetUsage = async () => {
+    if (resettingUsage) return;
+    const ok = await confirm({
+      title: "清零用量统计",
+      message:
+        "确定清零全部 token 用量与预算进度吗？\n\n书籍数据不受影响；适合按月/按周期重置预算。",
+      okLabel: "清零",
+      danger: true,
+    });
+    if (!ok) return;
+    setResettingUsage(true);
+    try {
+      await resetLlmUsage();
+      await reloadUsage();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setResettingUsage(false);
+    }
+  };
+
+  // ---- 价格编辑表 ----
+
+  /** 编辑行集合：生效价格模型 ∪ 已显式配置模型（去重，保持插入序） */
+  const pricingRows: string[] = (() => {
+    const seen = new Set<string>();
+    const rows: string[] = [];
+    const push = (m: string) => {
+      const key = m.trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      rows.push(key);
+    };
+    pricingEffective.forEach((p) => push(p.model));
+    pricing.forEach((p) => push(p.model));
+    providers.forEach((p) => p.models.forEach(push));
+    return rows;
+  })();
+
+  /** 某模型的展示值：显式配置 > 生效价（内置预设）> 空 */
+  const pricingValueOf = (model: string): ModelPricing =>
+    pricing.find((p) => p.model === model) ??
+    pricingEffective.find((p) => p.model === model) ?? {
+      model,
+      input_per_m: 0,
+      output_per_m: 0,
+    };
+
+  /** 编辑某模型价格：以当前展示值为底合并改动，写入显式配置 */
+  const patchPricing = (model: string, patch: Partial<ModelPricing>) =>
+    setPricing((prev) => {
+      const base = pricingValueOf(model);
+      const merged = { ...base, ...patch, model };
+      const exists = prev.some((p) => p.model === model);
+      return exists
+        ? prev.map((p) => (p.model === model ? merged : p))
+        : [...prev, merged];
+    });
+
+  /** 用量行成本的展示格式：大额两位小数，小额四位小数 */
+  const fmtCost = (c: number | null | undefined) =>
+    c == null ? "—" : `¥${c >= 1 ? c.toFixed(2) : c.toFixed(4)}`;
 
   // ---- 书库子选项卡 ----
 
@@ -454,6 +552,27 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 />
               </label>
 
+              <label className="modal-label">
+                Token 预算（累计用量达到后自动中断 LLM 调用；留空 = 不限）
+                <input
+                  type="number"
+                  min={0}
+                  step={10000}
+                  value={budgetTokens ?? ""}
+                  placeholder="如 5000000"
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    setBudgetTokens(
+                      e.target.value === "" || Number.isNaN(n) || n <= 0
+                        ? null
+                        : Math.floor(n),
+                    );
+                  }}
+                  disabled={saving}
+                  style={{ maxWidth: 200 }}
+                />
+              </label>
+
               <div className="modal-actions">
                 {saved && <span className="save-ok">已保存</span>}
                 {error && <span className="modal-error">{error}</span>}
@@ -463,10 +582,47 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
 
               <div className="usage-block">
-                <h2>Token 用量统计</h2>
+                <h2>Token 用量与成本</h2>
+
+                {/* 预算进度 */}
+                <div className="budget-bar">
+                  <div className="budget-text">
+                    累计 {usageTotalTokens.toLocaleString()} tokens
+                    {usageTotalCost != null && ` · 预估成本 ${fmtCost(usageTotalCost)}`}
+                    {budgetTokens
+                      ? ` · 预算 ${budgetTokens.toLocaleString()}（${Math.min(
+                          100,
+                          Math.round((usageTotalTokens / budgetTokens) * 100),
+                        )}%）`
+                      : " · 未设置预算"}
+                    {budgetTokens && usageTotalTokens >= budgetTokens && (
+                      <span className="budget-exceeded"> · 已达预算，LLM 调用已中断</span>
+                    )}
+                  </div>
+                  {budgetTokens != null && budgetTokens > 0 && (
+                    <div className="progress-bar batch">
+                      <div
+                        className={`progress-fill ${usageTotalTokens >= budgetTokens ? "over" : ""}`}
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round((usageTotalTokens / budgetTokens) * 100),
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                  <div className="budget-hint">
+                    每次调用按响应中的用量精确累计；成本按下方价格表换算。
+                    {budgetTokens
+                      ? " 达到预算后所有 LLM 功能自动中断（融合/翻译降级、书虫报错），清零用量或调整预算后恢复。"
+                      : ""}
+                  </div>
+                </div>
+
                 {usage.length === 0 ? (
                   <div className="form-hint">
-                    暂无用量记录（简介融合、AI 书评调用后自动累计）
+                    暂无用量记录（简介融合、AI 书评、书虫调用后自动累计）
                   </div>
                 ) : (
                   <table className="usage-table">
@@ -477,6 +633,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                         <th>输入</th>
                         <th>输出</th>
                         <th>总计</th>
+                        <th>预估成本</th>
                         <th>最近使用</th>
                       </tr>
                     </thead>
@@ -488,17 +645,106 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                           <td>{u.prompt_tokens.toLocaleString()}</td>
                           <td>{u.completion_tokens.toLocaleString()}</td>
                           <td className="total">{u.total_tokens.toLocaleString()}</td>
+                          <td>{fmtCost(u.cost)}</td>
                           <td>{u.last_used ?? "—"}</td>
                         </tr>
                       ))}
+                      <tr className="usage-total-row">
+                        <td>合计</td>
+                        <td>—</td>
+                        <td>—</td>
+                        <td>—</td>
+                        <td className="total">{usageTotalTokens.toLocaleString()}</td>
+                        <td>{fmtCost(usageTotalCost)}</td>
+                        <td>—</td>
+                      </tr>
                     </tbody>
                   </table>
                 )}
+
+                <div className="usage-actions">
+                  <button
+                    className="btn small"
+                    onClick={() => void onResetUsage()}
+                    disabled={resettingUsage || usage.length === 0}
+                  >
+                    {resettingUsage ? "清零中…" : "清零用量"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="usage-block">
+                <h2>模型价格（元 / 百万 tokens）</h2>
+                <div className="form-hint">
+                  成本 = 输入量 × 输入价 + 输出量 × 输出价。未配置的模型按内置参考价估算，
+                  可直接修改覆盖；价格留空（0）的行保存时丢弃。
+                </div>
+                {pricingRows.length === 0 ? (
+                  <div className="form-hint">添加服务商与模型后可在此配置价格</div>
+                ) : (
+                  <table className="usage-table pricing-table">
+                    <thead>
+                      <tr>
+                        <th>模型</th>
+                        <th>输入价</th>
+                        <th>输出价</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pricingRows.map((model) => {
+                        const row = pricingValueOf(model);
+                        return (
+                          <tr key={model}>
+                            <td>{model}</td>
+                            <td>
+                              <input
+                                type="number"
+                                min={0}
+                                step={0.1}
+                                value={row.input_per_m || ""}
+                                placeholder="不计成本"
+                                onChange={(e) =>
+                                  patchPricing(model, {
+                                    input_per_m:
+                                      e.target.value === "" ? 0 : Number(e.target.value),
+                                  })
+                                }
+                                disabled={saving}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                min={0}
+                                step={0.1}
+                                value={row.output_per_m || ""}
+                                placeholder="不计成本"
+                                onChange={(e) =>
+                                  patchPricing(model, {
+                                    output_per_m:
+                                      e.target.value === "" ? 0 : Number(e.target.value),
+                                  })
+                                }
+                                disabled={saving}
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+                <div className="modal-actions">
+                  <button className="btn small primary" onClick={onSaveLlm} disabled={saving}>
+                    {saving ? "保存中…" : "保存价格与预算"}
+                  </button>
+                </div>
               </div>
             </>
           )}
         </div>
       </div>
+      {confirmElement}
     </div>
   );
 }

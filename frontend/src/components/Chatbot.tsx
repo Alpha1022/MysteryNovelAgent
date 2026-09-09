@@ -1,20 +1,115 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { cancelTask, chatbotChat } from "../api/tauri";
+import {
+  cancelTask,
+  chatbotChat,
+  getBookDetail,
+  llmStatus,
+  mergeBooks,
+  saveBookReview,
+  setBookStatus,
+  updateBookMeta,
+} from "../api/tauri";
 import { readTextFile, writeTextFile } from "../api/picker";
 import { renderMarkdown } from "../utils/markdown";
-import type { ChatMessage, ChatSession, ChatStep } from "../types";
+import type { BookDetail, ChatMessage, ChatSession, ChatStep } from "../types";
+import EditMetaModal from "./EditMetaModal";
+import ReviewModal, { type ReviewTarget } from "./ReviewModal";
+import { useConfirm } from "./ConfirmDialog";
 
 /**
  * 书虫 · 阅读助手：右下角悬浮入口。
  * - 回复内容支持基础 Markdown 渲染
  * - 展示 Agent 实际工具调用轨迹（工具名 / 实参 / 结果，可折叠）
  * - 多会话管理：历史任务可查看、切换、删除；会话可导出/导入 JSON（完整上下文）
+ * - 写操作工具（改元数据 / 切换状态 / 合并）不在后端直接执行：
+ *   检测到对应工具轨迹后弹出与主界面一致的确认/编辑窗口，用户确认才生效
  */
 
 const SESSIONS_KEY = "mna-chat-sessions";
 const CURRENT_KEY = "mna-chat-current";
+
+/** 书虫发起的待确认写操作（从回复的工具轨迹中解析） */
+type PendingAction =
+  | {
+      kind: "meta";
+      bookId: number;
+      patch: {
+        title?: string;
+        author?: string;
+        tags?: string;
+        description?: string;
+        seriesName?: string;
+        seriesOrder?: number;
+      };
+    }
+  | {
+      kind: "status";
+      bookId: number;
+      status: string;
+      review?: string;
+      generateReview?: boolean;
+    }
+  | { kind: "merge"; ids: number[] };
+
+/** 从工具轨迹中提取写操作（去重；顺序保持调用次序） */
+function collectActions(steps: ChatStep[]): PendingAction[] {
+  const actions: PendingAction[] = [];
+  const seen = new Set<string>();
+  for (const s of steps) {
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(s.args) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const bookId = typeof args.book_id === "number" ? args.book_id : null;
+    const str = (k: string) =>
+      typeof args[k] === "string" && (args[k] as string).trim() ? (args[k] as string) : undefined;
+    const num = (k: string) => (typeof args[k] === "number" ? (args[k] as number) : undefined);
+    let action: PendingAction | null = null;
+    if (s.tool === "update_book_meta" && bookId != null) {
+      action = {
+        kind: "meta",
+        bookId,
+        patch: {
+          title: str("title"),
+          author: str("author"),
+          tags: str("tags"),
+          description: str("description"),
+          seriesName: str("series_name"),
+          seriesOrder: num("series_order"),
+        },
+      };
+    } else if (s.tool === "set_book_status" && bookId != null) {
+      action = {
+        kind: "status",
+        bookId,
+        status: String(args.status ?? ""),
+        review: str("review"),
+        generateReview: args.generate_review === true,
+      };
+    } else if (s.tool === "merge_books" && Array.isArray(args.book_ids)) {
+      const ids = (args.book_ids as unknown[]).filter(
+        (v): v is number => typeof v === "number",
+      );
+      if (ids.length >= 2) action = { kind: "merge", ids };
+    }
+    if (action) {
+      const key = JSON.stringify(action);
+      if (!seen.has(key)) {
+        seen.add(key);
+        actions.push(action);
+      }
+    }
+  }
+  return actions;
+}
+
+/** 通知书架刷新（书虫写操作完成后广播） */
+const notifyLibraryRefresh = () =>
+  window.dispatchEvent(new CustomEvent("mna:library-refresh"));
 
 function loadSessions(): ChatSession[] {
   try {
@@ -86,6 +181,7 @@ function MessageBubble({ m }: { m: ChatMessage }) {
 }
 
 export default function Chatbot() {
+  const { confirm, confirmElement } = useConfirm();
   const [open, setOpen] = useState(false);
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
   const [currentId, setCurrentId] = useState<string>(
@@ -100,6 +196,147 @@ export default function Chatbot() {
   const [liveSteps, setLiveSteps] = useState<ChatStep[]>([]);
   const listRef = useRef<HTMLDivElement>(null);
   const chatTaskIdRef = useRef<string>("");
+
+  // ---- 写操作确认流（队列 + 各动作的弹窗状态） ----
+  const [actionQueue, setActionQueue] = useState<PendingAction[]>([]);
+  /** 元数据编辑弹窗的目标（书虫补丁已应用到 BookDetail 上） */
+  const [metaEditBook, setMetaEditBook] = useState<BookDetail | null>(null);
+  /** 苏格拉底式短评生成弹窗目标 */
+  const [reviewTarget, setReviewTarget] = useState<ReviewTarget | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
+
+  const dequeueAction = () => setActionQueue((q) => q.slice(1));
+
+  /** 逐个处理待确认动作（弹窗互斥：上一关闭后才处理下一个）
+   *
+   * 注意不用 effect cleanup 取消：actionBusy 在依赖里，置位即触发 effect 重跑，
+   * cleanup 若置 cancelled 会把首次执行的出队逻辑吞掉（队列卡死）；
+   * processAction 内部自捕获错误，这里 finally 保证必定出队。 */
+  useEffect(() => {
+    if (actionQueue.length === 0 || metaEditBook || reviewTarget || actionBusy) return;
+    const action = actionQueue[0];
+    setActionBusy(true);
+    void (async () => {
+      try {
+        await processAction(action);
+      } finally {
+        setActionBusy(false);
+        dequeueAction();
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actionQueue, metaEditBook, reviewTarget, actionBusy]);
+
+  /** 执行单个待确认动作：拉取详情 → 按类型弹确认/编辑窗口 */
+  const processAction = async (action: PendingAction) => {
+    try {
+      if (action.kind === "meta") {
+        const d = await getBookDetail(action.bookId);
+        if (!d) {
+          setNotice("书虫请求修改的书籍不存在（可能已被删除）");
+          return;
+        }
+        const p = action.patch;
+        setMetaEditBook({
+          ...d,
+          title: p.title ?? d.title,
+          author: p.author ?? d.author,
+          tags: p.tags ?? d.tags,
+          description: p.description != null ? p.description : d.description,
+          series_name: p.seriesName ?? d.series_name,
+          series_order: p.seriesOrder ?? d.series_order,
+        });
+        // 弹窗关闭时由 onClose 负责出队
+        return;
+      }
+
+      if (action.kind === "status") {
+        const d = await getBookDetail(action.bookId);
+        if (!d) {
+          setNotice("书虫请求操作的书籍不存在（可能已被删除）");
+          return;
+        }
+        if (action.review) {
+          const ok = await confirm({
+            title: "书虫请求标记已读",
+            message: `书虫想将《${d.title}》标记为已读，并保存以下短评：\n\n${action.review}\n\n确认保存？`,
+            okLabel: "标记并保存",
+          });
+          if (ok) {
+            await setBookStatus(action.bookId, action.status);
+            await saveBookReview(action.bookId, action.review);
+            setNotice(`《${d.title}》已标记为已读并保存短评`);
+            notifyLibraryRefresh();
+          }
+        } else if (action.generateReview) {
+          const ok = await confirm({
+            title: "书虫请求生成短评",
+            message: `书虫想将《${d.title}》标记为已读，并打开 AI 引导式短评生成窗口。\n确认？`,
+            okLabel: "打开短评窗口",
+          });
+          if (ok) {
+            await setBookStatus(action.bookId, action.status);
+            setReviewTarget({
+              id: d.id,
+              title: d.title,
+              author: d.author,
+              tags: d.tags,
+            });
+            // 弹窗关闭时由 onClose 负责出队
+            return;
+          }
+        } else {
+          const ok = await confirm({
+            title: "书虫请求切换阅读状态",
+            message: `书虫想将《${d.title}》的阅读状态改为「${action.status}」。\n确认？`,
+            okLabel: "确认",
+          });
+          if (ok) {
+            await setBookStatus(action.bookId, action.status);
+            setNotice(`《${d.title}》已标记为「${action.status}」`);
+            notifyLibraryRefresh();
+          }
+        }
+        return;
+      }
+
+      if (action.kind === "merge") {
+        const details = await Promise.all(
+          action.ids.map(async (id) => {
+            const d = await getBookDetail(id);
+            return d?.title ?? `ID ${id}`;
+          }),
+        );
+        const titles = details;
+        const ok = await confirm({
+          title: "合并确认",
+          message: `书虫想按以下顺序合并 ${action.ids.length} 本书：\n${titles
+            .map((t, i) => `${i + 1}. 《${t}》`)
+            .join("\n")}\n\n将创建合集（封面取第一本、来源项目与短评按顺序合并），原书将从书架移除（原始导入文件不受影响）。`,
+          okLabel: "合并",
+          danger: true,
+        });
+        if (!ok) return;
+        // 固定流程：多本简介且 LLM 可用时询问是否融合（与书架多选合并一致）
+        let mergeDesc = false;
+        const llm = await llmStatus().catch(() => null);
+        if (llm?.configured) {
+          mergeDesc = await confirm({
+            title: "简介合并",
+            message:
+              "是否调用 LLM 将多本书的简介合并为一段？\n选择「取第一本」则仅保留第一本书的简介。",
+            okLabel: "合并简介",
+            cancelLabel: "取第一本",
+          });
+        }
+        const res = await mergeBooks(action.ids, mergeDesc);
+        setNotice(`已合并为《${res.title}》`);
+        notifyLibraryRefresh();
+      }
+    } catch (e) {
+      setNotice(`操作失败：${String(e)}`);
+    }
+  };
 
   // 订阅书虫 agent 的实时工具轨迹
   useEffect(() => {
@@ -183,6 +420,9 @@ export default function Chatbot() {
         ],
         savedAt: Date.now(),
       }));
+      // 写操作工具：从轨迹中提取待确认动作，弹窗确认后生效
+      const acts = collectActions(res.steps ?? []);
+      if (acts.length > 0) setActionQueue((q) => [...q, ...acts]);
     } catch (e) {
       // 打断不算错误：给出友好提示
       if (String(e).includes("已取消") || String(e).includes("任务已取消")) {
@@ -417,6 +657,47 @@ export default function Chatbot() {
       >
         {open ? "×" : "🤖"}
       </button>
+
+      {/* 书虫写操作的确认/编辑弹窗（与主界面共用同一套组件） */}
+      {metaEditBook && (
+        <EditMetaModal
+          key={`chatbot-meta-${metaEditBook.id}`}
+          book={metaEditBook}
+          busy={false}
+          error={null}
+          onSave={(params) => {
+            void (async () => {
+              try {
+                await updateBookMeta(
+                  metaEditBook.id,
+                  params.title,
+                  params.author,
+                  params.tags,
+                  params.description,
+                  params.seriesName,
+                  params.seriesOrder,
+                );
+                setNotice(`《${params.title}》元数据已更新`);
+                setMetaEditBook(null);
+                notifyLibraryRefresh();
+              } catch (e) {
+                setNotice(`元数据保存失败：${String(e)}`);
+              }
+            })();
+          }}
+          onClose={() => setMetaEditBook(null)}
+        />
+      )}
+      {reviewTarget && (
+        <ReviewModal
+          target={reviewTarget}
+          onClose={(changed) => {
+            setReviewTarget(null);
+            if (changed) notifyLibraryRefresh();
+          }}
+        />
+      )}
+      {confirmElement}
     </>
   );
 }

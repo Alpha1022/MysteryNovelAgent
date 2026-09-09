@@ -1,0 +1,171 @@
+# ============================================================================
+# GitLab CI：自动构建与发布
+#
+# 触发时机：
+#   - 默认分支每次 push / 手动触发 → 构建全部产物并上传到
+#     generic package registry 的 "continuous" 版本（同名覆盖，永远是最新），
+#     下载入口：项目页 → Deploy → Package Registry
+#   - 推送 v* 标签 → 构建正式 Release（产物挂到 Release 页）
+#
+# 构建矩阵（Linux Docker runner）：
+#   - build:linux-cli   原生构建 CLI（mystery-novel-agent-linux-amd64）
+#   - build:windows     cargo-xwin 交叉编译：
+#                       ① Tauri GUI NSIS 安装包（--runner cargo-xwin，
+#                          tauri 官方 Linux→Windows 跨平台方案）
+#                       ② Windows CLI exe
+#
+# 前提与调整：
+#   - 需要可用的 Docker executor 共享 runner；若课程 GitLab 要求 tags
+#     （如 runner 标签），在各 job 加 `tags: [...]`
+#   - 缓存只存 cargo registry / xwin SDK / npm（target 目录数 GB，
+#     容易超实例缓存上限，故不缓存 —— 每次全量编译约 20-40 分钟）
+#   - 如需 Android APK / Linux GUI 包，参照 build:windows 扩展 job
+#   - 推标签发版：git tag v0.1.0 && git push origin v0.1.0
+# ============================================================================
+
+workflow:
+  rules:
+    # 手动触发（Run pipeline 按钮）
+    - if: $CI_PIPELINE_SOURCE == "web"
+    # 正式发版：标签
+    - if: $CI_COMMIT_TAG
+    # 默认分支每次 push：滚动构建
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - build
+  - publish
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "5"
+  RUST_BACKTRACE: "1"
+  PKG_NAME: "mystery-novel-agent"
+  WIN_TARGET: "x86_64-pc-windows-msvc"
+  # cargo-xwin 拉取的 Windows SDK/CRT 缓存（可缓存，重复下载约 200MB）
+  XWIN_CACHE_DIR: "$CI_PROJECT_DIR/.xwin-cache"
+
+# ---------------------------------------------------------------- CLI (Linux)
+build:linux-cli:
+  stage: build
+  image: rust:1-bookworm
+  interruptible: true
+  timeout: 90m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  cache:
+    key: cargo-registry-linux
+    paths:
+      - .cargo-home/registry/
+      - .cargo-home/git/
+  script:
+    - cargo build --release --locked -p mystery-novel-agent
+    - mkdir -p dist
+    - cp target/release/mystery-novel-agent "dist/${PKG_NAME}-linux-amd64"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+# ------------------------------------------- GUI 安装包 + CLI (Linux 交叉编译)
+build:windows:
+  stage: build
+  image: rust:1-bookworm
+  interruptible: true
+  timeout: 2h
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  cache:
+    key: cargo-xwin-cache
+    paths:
+      - .cargo-home/registry/
+      - .cargo-home/git/
+      - .cargo-home/bin/
+      - .xwin-cache/
+      - frontend/.npm/
+  before_script:
+    # 跨编译依赖：clang/llvm（cargo-xwin）、nsis（tauri 打包）、node（前端构建）
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends clang llvm nsis nodejs npm curl
+    - rustup target add "$WIN_TARGET"
+    - cargo install --locked cargo-xwin
+    - cargo install --locked tauri-cli --version "^2"
+  script:
+    # 前端依赖（tauri 的 beforeBuildCommand 只执行 npm run build，需先装好 node_modules）
+    - cd frontend && npm ci --cache .npm --prefer-offline && cd ..
+    # GUI：NSIS 安装包（tauri.conf.json 的 beforeBuildCommand 自动构建前端）
+    - cargo tauri build --runner cargo-xwin --target "$WIN_TARGET" --bundles nsis
+    # CLI：Windows 版可执行文件
+    - cargo xwin build --release --locked -p mystery-novel-agent --target "$WIN_TARGET"
+    - mkdir -p dist
+    # 产物统一 ASCII 命名（避免非 ASCII 文件名进 API / 下载链接）
+    - cp "target/${WIN_TARGET}/release/bundle/nsis/"*-setup.exe dist/mystery-shelf-windows-x64-setup.exe
+    - cp "target/${WIN_TARGET}/release/mystery-novel-agent.exe" "dist/${PKG_NAME}-windows-x64.exe"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+# -------------------------------------- 滚动发布（默认分支 push → continuous）
+publish:continuous:
+  stage: publish
+  image: curlimages/curl:latest
+  needs:
+    - job: build:linux-cli
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      set -eu
+      for f in dist/*; do
+        base=$(basename "$f")
+        echo "上传 ${base} → ${PKG_NAME}/continuous"
+        curl --fail --retry 3 \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/continuous/${base}"
+      done
+      echo ""
+      echo "最新产物下载页：${CI_PROJECT_URL}/-/packages?type=GENERIC"
+
+# ----------------------------------------------- 正式发布（v* 标签 → Release）
+publish:release:
+  stage: publish
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: build:linux-cli
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      set -eu
+      ASSET_ARGS=""
+      for f in dist/*; do
+        base=$(basename "$f")
+        url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/${CI_COMMIT_TAG}/${base}"
+        echo "上传 ${base} → ${PKG_NAME}/${CI_COMMIT_TAG}"
+        curl --fail --retry 3 \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$f" \
+          "$url"
+        ASSET_ARGS="$ASSET_ARGS --assets-link {\"name\":\"${base}\",\"url\":\"${url}\"}"
+      done
+      # shellcheck disable=SC2086  # 产物文件名均为 ASCII 且无空格，故意分词展开
+      release-cli create \
+        --name "Release ${CI_COMMIT_TAG}" \
+        --tag-name "${CI_COMMIT_TAG}" \
+        --description "标签 ${CI_COMMIT_TAG} 的自动构建产物：Windows 安装包（NSIS）+ Windows/Linux CLI。" \
+        $ASSET_ARGS

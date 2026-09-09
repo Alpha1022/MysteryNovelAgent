@@ -134,6 +134,7 @@ pub fn run() {
       commands::update_book_meta,
       commands::get_settings,
       commands::save_settings,
+      commands::reset_llm_usage,
       commands::llm_status,
       commands::cancel_task,
       commands::cancel_sync_task,

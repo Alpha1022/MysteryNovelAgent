@@ -2684,7 +2684,17 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
 - search_books：按关键词搜索书籍（匹配书名/作者）\n\
 - filter_books：按阅读状态/作者/标签筛选书籍\n\
 - get_book_detail：查看某本书的完整详情（book_id 来自搜索/筛选结果）\n\
-- get_book_comments：查看某本书的网络短评列表\n\n\
+- get_book_comments：查看某本书的网络短评列表\n\
+- search_claspclub：在线书目库检索 —— 书架之外的问题（某作者还写过什么、\
+某本没读过的书值不值得读）用它查，结果来自互联网而非本地书架；\
+本地藏书始终用 search_books / filter_books\n\
+你也可以代用户发起写操作（修改元数据 / 切换阅读状态 / 合并书籍）：\n\
+- update_book_meta：修改元数据（只传需要改的字段）\n\
+- set_book_status：切换阅读状态；标记已读可携带双方交流总结出的短评，\
+或请求打开 AI 引导式短评生成窗口\n\
+- merge_books：把多本（上下册/系列）按顺序合并为合集\n\
+写操作不会直接生效——应用会弹出确认或编辑窗口，由用户最终确认。\
+调用后请告知用户「已在界面弹出窗口，请在窗口中确认」，不要声称已完成修改。\n\n\
 == 书库概览（含每本书的简短简介与短评节选）==\n{knowledge}",
     lib_title = lib_title,
     total = books.len(),
@@ -2753,6 +2763,77 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
             "limit": { "type": "integer", "description": "最多返回条数，默认 5，最大 10" }
           },
           "required": ["book_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_claspclub",
+        "description": "在线书目库检索（claspclub）：查书架之外的书籍信息 —— 书名/作者/标签/无剧透简介。适合回答「某作者还写过什么」「某本没入手的书大概讲什么、值不值得读」。注意结果来自互联网而非本地书架。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keyword": { "type": "string", "description": "书名或作者关键词" },
+            "page": { "type": "integer", "description": "页码，默认 1（每页 5 条；翻页用）" }
+          },
+          "required": ["keyword"]
+        }
+      }
+    },
+
+    {
+      "type": "function",
+      "function": {
+        "name": "update_book_meta",
+        "description": "修改某本书的元数据（书名/作者/标签/简介/系列）。不直接生效：会弹出与详情页一致的编辑窗口，由用户确认后才保存。只传需要修改的字段，未传字段保持原值。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "book_id": { "type": "integer", "description": "书籍 ID（来自搜索/筛选结果）" },
+            "title": { "type": "string", "description": "新书名（可选）" },
+            "author": { "type": "string", "description": "新作者（可选）" },
+            "tags": { "type": "string", "description": "新标签，逗号分隔（可选）" },
+            "description": { "type": "string", "description": "新简介（可选）" },
+            "series_name": { "type": "string", "description": "系列名，空字符串表示清除系列（可选）" },
+            "series_order": { "type": "integer", "description": "卷号，从 1 开始（可选）" }
+          },
+          "required": ["book_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_book_status",
+        "description": "修改某本书的阅读状态（想读/在读/已读）。不直接生效：会弹出确认窗口由用户确认。标记已读时可选携带短评（与用户交流总结得到的），或请求打开 AI 引导式短评生成窗口。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "book_id": { "type": "integer", "description": "书籍 ID" },
+            "status": { "type": "string", "description": "目标状态：想读 / 在读 / 已读" },
+            "review": { "type": "string", "description": "短评内容（仅状态为已读时有意义；来自与用户的交流，需用户确认后保存）" },
+            "generate_review": { "type": "boolean", "description": "true = 打开 AI 引导式短评生成窗口（与 review 互斥；仅已读状态有意义）" }
+          },
+          "required": ["book_id", "status"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "merge_books",
+        "description": "把多本书按给定顺序合并为一个合集（EPUB + 来源 + 短评，删除原书记录；第一本的封面作为合集封面）。不直接生效：会弹出确认窗口，由用户确认后执行固定合并流程。适用于上下册/系列合集。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "book_ids": {
+              "type": "array",
+              "items": { "type": "integer" },
+              "description": "按合并顺序排列的书籍 ID（至少 2 本；顺序即合集中的卷序）"
+            }
+          },
+          "required": ["book_ids"]
         }
       }
     }
@@ -2866,6 +2947,86 @@ fn execute_chatbot_tool(
         }
         Err(e) => err(e.to_string()),
       }
+    }
+
+    // ---- 三个「写操作」工具：不在后端直接执行，校验后返回待确认标记， ----
+    // ---- 由前端检测工具轨迹并弹出确认/编辑窗口（用户确认后走固定流程） ----
+    "update_book_meta" => {
+      let Some(id) = get_i64("book_id") else {
+        return err("缺少 book_id 参数".into());
+      };
+      match db::get_book_detail(conn, id) {
+        Ok(Some(d)) => serde_json::json!({
+          "status": "pending_confirmation",
+          "message": format!("已请求用户在弹出的编辑窗口中确认《{}》的元数据修改（当前值已在窗口中预填，未传字段保持原值）", d.title),
+        })
+        .to_string(),
+        Ok(None) => err("书籍不存在".into()),
+        Err(e) => err(e.to_string()),
+      }
+    }
+    "set_book_status" => {
+      let Some(id) = get_i64("book_id") else {
+        return err("缺少 book_id 参数".into());
+      };
+      let Some(status) = get_str("status") else {
+        return err("缺少 status 参数（想读 / 在读 / 已读）".into());
+      };
+      if !matches!(status.as_str(), "想读" | "在读" | "已读") {
+        return err(format!("无效的状态「{status}」（仅支持 想读 / 在读 / 已读）"));
+      }
+      let review = get_str("review");
+      let generate = args.get("generate_review").and_then(|v| v.as_bool()).unwrap_or(false);
+      if status != "已读" && (review.is_some() || generate) {
+        return err("review / generate_review 仅在标记「已读」时有效".into());
+      }
+      if review.is_some() && generate {
+        return err("review 与 generate_review 互斥：要么直接携带短评，要么打开 AI 生成窗口".into());
+      }
+      match db::get_book_detail(conn, id) {
+        Ok(Some(d)) => serde_json::json!({
+          "status": "pending_confirmation",
+          "message": format!(
+            "已请求用户确认将《{}》标记为「{status}」{}",
+            d.title,
+            match (&review, generate) {
+              (Some(_), _) => "并保存给定的短评",
+              (None, true) => "并打开 AI 短评生成窗口",
+              (None, false) => "",
+            }
+          ),
+        })
+        .to_string(),
+        Ok(None) => err("书籍不存在".into()),
+        Err(e) => err(e.to_string()),
+      }
+    }
+    "merge_books" => {
+      let Some(ids) = args.get("book_ids").and_then(|v| v.as_array()) else {
+        return err("缺少 book_ids 参数（按合并顺序的书籍 ID 数组）".into());
+      };
+      let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
+      if ids.len() < 2 {
+        return err("合并至少需要 2 本书".into());
+      }
+      // 逐本校验存在性并取标题（确认文案展示用）
+      let mut titles = Vec::new();
+      for id in &ids {
+        match db::get_book_detail(conn, *id) {
+          Ok(Some(d)) => titles.push(d.title),
+          Ok(None) => return err(format!("书籍 ID {id} 不存在")),
+          Err(e) => return err(e.to_string()),
+        }
+      }
+      serde_json::json!({
+        "status": "pending_confirmation",
+        "message": format!(
+          "已请求用户确认按顺序合并 {} 本书：{}。确认后将执行固定合并流程（原书记录移除，第一本封面作为合集封面）",
+          titles.len(),
+          titles.iter().map(|t| format!("《{t}》")).collect::<Vec<_>>().join("、")
+        ),
+      })
+      .to_string()
     }
     _ => err(format!("未知工具: {name}")),
   }
@@ -3050,45 +3211,101 @@ pub async fn chatbot_chat(
       tool_call_id: None,
     });
 
-    // 逐个执行工具并回填结果（轨迹收集至 steps，供前端展示；实时推送）
-    {
-      let conn = state.lock().map_err(|e| e.to_string())?;
-      for call in &calls {
-        let call_id = call
-          .get("id")
-          .and_then(|v| v.as_str())
-          .unwrap_or("")
-          .to_string();
-        let fn_obj = call.get("function");
-        let name = fn_obj
-          .and_then(|f| f.get("name"))
-          .and_then(|v| v.as_str())
-          .unwrap_or("")
-          .to_string();
-        let arg_str = fn_obj
-          .and_then(|f| f.get("arguments"))
-          .and_then(|v| v.as_str())
-          .unwrap_or("{}")
-          .to_string();
-        let args: serde_json::Value = serde_json::from_str(&arg_str)
-          .unwrap_or(serde_json::Value::Object(Default::default()));
-        let result = execute_chatbot_tool(&conn, lib_id.as_deref(), &name, &args);
-        steps.push(ChatStepDto {
-          tool: name.clone(),
-          args: arg_str,
-          result: result.chars().take(1500).collect(),
-        });
-        msgs.push(agent::Message {
-          role: "tool".into(),
-          content: result,
-          tool_calls: None,
-          tool_call_id: Some(call_id),
-        });
-        // 实时推送当前工具轨迹（打断检查放在每轮 LLM 调用前）
-        progress(&steps);
-      }
+    // 逐个执行工具并回填结果（轨迹收集至 steps，供前端展示；实时推送）。
+    // 逐工具短暂持锁：在线检索（search_claspclub）走网络且不碰数据库，
+    // 不能像其余工具那样在锁内执行整个批次。
+    for call in &calls {
+      let call_id = call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      let fn_obj = call.get("function");
+      let name = fn_obj
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      let arg_str = fn_obj
+        .and_then(|f| f.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}")
+        .to_string();
+      let args: serde_json::Value = serde_json::from_str(&arg_str)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+      let result = if name == "search_claspclub" {
+        search_claspclub_tool(&args).await
+      } else {
+        let conn = state.lock().map_err(|e| e.to_string())?;
+        execute_chatbot_tool(&conn, lib_id.as_deref(), &name, &args)
+      };
+      steps.push(ChatStepDto {
+        tool: name.clone(),
+        args: arg_str,
+        result: result.chars().take(1500).collect(),
+      });
+      msgs.push(agent::Message {
+        role: "tool".into(),
+        content: result,
+        tool_calls: None,
+        tool_call_id: Some(call_id),
+      });
+      // 实时推送当前工具轨迹（打断检查放在每轮 LLM 调用前）
+      progress(&steps);
     }
   }
+}
+
+/// 在线书目检索工具（claspclub 分页搜索；网络调用，不持数据库锁）
+///
+/// 供书虫回答书架之外的问题（"作者还写过什么""某本没入手的书值不值得读"）；
+/// 结果显式标注来源为在线书目库，并提示改用 search_books 查本地，
+/// 避免模型把线上信息与本机书架混淆。
+async fn search_claspclub_tool(args: &serde_json::Value) -> String {
+  let err = |msg: String| serde_json::json!({ "error": msg }).to_string();
+  let Some(keyword) = args
+    .get("keyword")
+    .and_then(|v| v.as_str())
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+  else {
+    return err("缺少 keyword 参数".into());
+  };
+  let page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(1).clamp(1, 10);
+  match ingestion::search_clasp_page(keyword, page).await {
+    Ok(p) => format_clasp_results(&p.items, p.fuzzy, p.total_pages, page),
+    Err(e) => err(format!("claspclub 检索失败: {e}")),
+  }
+}
+
+/// claspclub 检索结果 → 工具回包 JSON（纯函数，便于单测）
+fn format_clasp_results(
+  items: &[spider::ClaspBookSuggestion],
+  fuzzy: bool,
+  total_pages: i64,
+  page: i64,
+) -> String {
+  let results: Vec<serde_json::Value> = items
+    .iter()
+    .map(|i| {
+      serde_json::json!({
+        "title": i.title,
+        "author": i.author_name,
+        "tags": i.tags,
+        "summary": truncate_for_prompt(i.summary.as_deref().unwrap_or(""), 200),
+      })
+    })
+    .collect();
+  serde_json::json!({
+    "source": "claspclub 在线书目库（非本地书架）",
+    "query_match": if fuzzy { "fuzzy（无精确匹配，以下为相近结果）" } else { "exact" },
+    "page": page,
+    "total_pages": total_pages.max(1),
+    "count": results.len(),
+    "results": results,
+    "hint": "以上来自在线书目库；若要查本地书架的藏书请改用 search_books / filter_books",
+  })
+  .to_string()
 }
 
 /// GUI 多选合并结果
@@ -3169,7 +3386,18 @@ pub struct LlmProviderDto {
   pub models: Vec<String>,
 }
 
-/// 设置页的 LLM 配置（多 Provider）
+/// 模型价格（元 / 百万 tokens；输入与输出分开计价）
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ModelPricingDto {
+  #[serde(default)]
+  pub model: String,
+  #[serde(default)]
+  pub input_per_m: f64,
+  #[serde(default)]
+  pub output_per_m: f64,
+}
+
+/// 设置页的 LLM 配置（多 Provider + 预算 + 价格表）
 #[derive(Serialize, Deserialize)]
 pub struct LlmSettingsDto {
   #[serde(default)]
@@ -3181,16 +3409,60 @@ pub struct LlmSettingsDto {
   /// LLM 调用失败重试次数（None = 默认 2）
   #[serde(default)]
   pub retry_count: Option<u32>,
+  /// Token 预算（累计用量达到后拒绝新的 LLM 调用；None = 不限）
+  #[serde(default)]
+  pub budget_tokens: Option<i64>,
+  /// 模型价格表（空输入/输出价的行在保存时丢弃）
+  #[serde(default)]
+  pub pricing: Vec<ModelPricingDto>,
 }
 
-/// 设置页完整数据（LLM 配置 + 各模型 token 用量）
+/// 单个模型的用量行（含按价格表换算的预估成本）
+#[derive(Serialize)]
+pub struct LlmUsageDto {
+  pub model: String,
+  pub calls: i64,
+  pub prompt_tokens: i64,
+  pub completion_tokens: i64,
+  pub total_tokens: i64,
+  pub last_used: Option<String>,
+  /// 预估成本（元；模型无价格配置时为 None）
+  pub cost: Option<f64>,
+}
+
+/// 设置页完整数据（LLM 配置 + 用量/成本统计 + 预算）
 #[derive(Serialize)]
 pub struct SettingsDto {
   pub llm: LlmSettingsDto,
-  pub usage: Vec<db::LlmUsageRow>,
+  pub usage: Vec<LlmUsageDto>,
+  /// 全模型累计 token 总量
+  pub usage_total_tokens: i64,
+  /// 全模型累计预估成本（任一模型缺价格时仍汇总已知部分；全部未知为 None）
+  pub usage_total_cost: Option<f64>,
+  /// 生效价格表（显式配置 → 内置预设解析后的展示值；仅供编辑器预填展示）
+  pub pricing_effective: Vec<ModelPricingDto>,
 }
 
-/// 读取设置（config.toml llm 段 + DB 用量统计）
+/// 单行用量 → DTO（按设置页价格表换算成本）
+fn usage_row_to_dto(
+  row: &db::LlmUsageRow,
+  settings: &mystery_novel_agent::config::LlmSettings,
+) -> LlmUsageDto {
+  let cost = settings.price_for(&row.model).map(|(i, o)| {
+    row.prompt_tokens as f64 * i / 1_000_000.0 + row.completion_tokens as f64 * o / 1_000_000.0
+  });
+  LlmUsageDto {
+    model: row.model.clone(),
+    calls: row.calls,
+    prompt_tokens: row.prompt_tokens,
+    completion_tokens: row.completion_tokens,
+    total_tokens: row.total_tokens,
+    last_used: row.last_used.clone(),
+    cost,
+  }
+}
+
+/// 读取设置（config.toml llm 段 + DB 用量统计与成本换算）
 #[tauri::command]
 pub async fn get_settings(
   state: State<'_, Mutex<rusqlite::Connection>>,
@@ -3200,6 +3472,38 @@ pub async fn get_settings(
     let conn = state.lock().map_err(|e| e.to_string())?;
     db::get_llm_usage(&conn).map_err(|e| e.to_string())?
   };
+  let usage_dto: Vec<LlmUsageDto> = usage.iter().map(|r| usage_row_to_dto(r, &cfg.llm)).collect();
+  let usage_total_tokens: i64 = usage.iter().map(|r| r.total_tokens).sum();
+  // 全部行都有价格时才给出总成本（有未知价格的模型时部分汇总会误导）
+  let usage_total_cost = if usage_dto.is_empty() {
+    None
+  } else {
+    usage_dto.iter().map(|r| r.cost).collect::<Option<Vec<f64>>>().map(|v| v.iter().sum())
+  };
+  // 生效价格表：服务商模型 ∪ 有用量记录的模型（去掉 provider 前缀），按当前规则解析
+  let mut effective_models: Vec<String> = Vec::new();
+  for p in &cfg.llm.providers {
+    for m in &p.models {
+      let m = m.trim();
+      if !m.is_empty() && !effective_models.contains(&m.to_string()) {
+        effective_models.push(m.to_string());
+      }
+    }
+  }
+  for r in &usage {
+    let bare = r.model.rsplit('/').next().unwrap_or(&r.model).to_string();
+    if !effective_models.contains(&bare) {
+      effective_models.push(bare);
+    }
+  }
+  let pricing_effective: Vec<ModelPricingDto> = effective_models
+    .iter()
+    .filter_map(|m| {
+      cfg.llm
+        .price_for(m)
+        .map(|(i, o)| ModelPricingDto { model: m.clone(), input_per_m: i, output_per_m: o })
+    })
+    .collect();
   Ok(SettingsDto {
     llm: LlmSettingsDto {
       providers: cfg
@@ -3216,8 +3520,22 @@ pub async fn get_settings(
       default_provider: cfg.llm.default_provider,
       default_model: cfg.llm.default_model,
       retry_count: cfg.llm.retry_count,
+      budget_tokens: cfg.llm.budget_tokens,
+      pricing: cfg
+        .llm
+        .pricing
+        .iter()
+        .map(|p| ModelPricingDto {
+          model: p.model.clone(),
+          input_per_m: p.input_per_m,
+          output_per_m: p.output_per_m,
+        })
+        .collect(),
     },
-    usage,
+    usage: usage_dto,
+    usage_total_tokens,
+    usage_total_cost,
+    pricing_effective,
   })
 }
 
@@ -3285,11 +3603,43 @@ pub fn save_settings(settings: LlmSettingsDto) -> Result<(), String> {
     default_model,
     // 重试次数：0~10，越界截断
     retry_count: settings.retry_count.map(|r| r.min(10)),
+    // 预算：正值生效，非正值视为未设置
+    budget_tokens: settings.budget_tokens.filter(|b| *b > 0),
+    // 价格表：模型名非空、价格为非负数才保留；按模型名去重（后者覆盖前者）
+    pricing: {
+      let mut out: Vec<mystery_novel_agent::config::ModelPricing> = Vec::new();
+      for p in settings.pricing {
+        let model = p.model.trim().to_string();
+        if model.is_empty() || p.input_per_m < 0.0 || p.output_per_m < 0.0 {
+          continue;
+        }
+        if let Some(existing) = out.iter_mut().find(|x| x.model == model) {
+          existing.input_per_m = p.input_per_m;
+          existing.output_per_m = p.output_per_m;
+        } else {
+          out.push(mystery_novel_agent::config::ModelPricing {
+            model,
+            input_per_m: p.input_per_m,
+            output_per_m: p.output_per_m,
+          });
+        }
+      }
+      out
+    },
     base_url: None,
     api_key: None,
     models: Vec::new(),
   };
   cfg.save().map_err(|e| e.to_string())
+}
+
+/// 清零 token 用量统计（预算周期重置；不影响书籍数据）
+#[tauri::command]
+pub fn reset_llm_usage(
+  state: State<'_, Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+  let conn = state.lock().map_err(|e| e.to_string())?;
+  db::reset_llm_usage(&conn).map_err(|e| e.to_string())
 }
 
 // ============================= //
@@ -3386,4 +3736,103 @@ pub async fn save_book_review(
   let conn = state.lock().map_err(|e| e.to_string())?;
   db::save_review(&conn, id, &review).map_err(|e| e.to_string())?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn mem_db() -> rusqlite::Connection {
+    db::open_db(":memory:").unwrap()
+  }
+
+  /// 书虫写操作工具：不在后端直接执行，仅校验参数并返回待确认标记
+  #[test]
+  fn test_chatbot_action_tools_pending_confirmation() {
+    let conn = mem_db();
+    let a = db::insert_book(&conn, "钟表馆事件", "绫辻行人", "推理小说", "a.epub", "[]").unwrap();
+    let b = db::insert_book(&conn, "十角馆事件", "绫辻行人", "推理小说", "b.epub", "[]").unwrap();
+
+    // update_book_meta：书存在 → 待确认；书不存在 → 报错
+    let r = execute_chatbot_tool(
+      &conn,
+      None,
+      "update_book_meta",
+      &serde_json::json!({ "book_id": a, "title": "新标题" }),
+    );
+    assert!(r.contains("pending_confirmation"), "应返回待确认标记: {r}");
+    let r = execute_chatbot_tool(&conn, None, "update_book_meta", &serde_json::json!({ "book_id": 999 }));
+    assert!(r.contains("error"), "不存在的书应报错: {r}");
+
+    // set_book_status：合法状态 → 待确认；非法状态 / review 与 generate 互斥 → 报错
+    let r = execute_chatbot_tool(
+      &conn,
+      None,
+      "set_book_status",
+      &serde_json::json!({ "book_id": a, "status": "已读", "review": "很精彩" }),
+    );
+    assert!(r.contains("pending_confirmation"), "{r}");
+    let r = execute_chatbot_tool(&conn, None, "set_book_status", &serde_json::json!({ "book_id": a, "status": "读完" }));
+    assert!(r.contains("无效的状态"), "{r}");
+    let r = execute_chatbot_tool(
+      &conn,
+      None,
+      "set_book_status",
+      &serde_json::json!({ "book_id": a, "status": "已读", "review": "x", "generate_review": true }),
+    );
+    assert!(r.contains("互斥"), "{r}");
+    // 非已读状态携带 review → 报错
+    let r = execute_chatbot_tool(
+      &conn,
+      None,
+      "set_book_status",
+      &serde_json::json!({ "book_id": a, "status": "在读", "review": "x" }),
+    );
+    assert!(r.contains("仅在标记"), "{r}");
+
+    // merge_books：≥2 本且全部存在 → 待确认；缺本 / 只有 1 本 → 报错
+    let r = execute_chatbot_tool(&conn, None, "merge_books", &serde_json::json!({ "book_ids": [a, b] }));
+    assert!(r.contains("pending_confirmation"), "{r}");
+    let r = execute_chatbot_tool(&conn, None, "merge_books", &serde_json::json!({ "book_ids": [a] }));
+    assert!(r.contains("至少需要 2 本"), "{r}");
+    let r = execute_chatbot_tool(&conn, None, "merge_books", &serde_json::json!({ "book_ids": [a, 999] }));
+    assert!(r.contains("不存在"), "{r}");
+  }
+
+  /// claspclub 检索结果格式化：来源标注 / fuzzy 标记 / 本地检索指引
+  #[test]
+  fn test_format_clasp_results() {
+    let items = vec![
+      spider::ClaspBookSuggestion {
+        title: "钟表馆事件".into(),
+        author_name: "绫辻行人".into(),
+        id: "c1".into(),
+        tags: vec!["本格推理".into()],
+        cover_url: None,
+        summary: Some("镰仓的寂静山林……".into()),
+        douban_url: None,
+      },
+      spider::ClaspBookSuggestion {
+        title: "某很长的书名，其简介也非常非常长，需要被截断处理以控制上下文体积。".into(),
+        author_name: "某人".into(),
+        id: "c2".into(),
+        tags: vec![],
+        cover_url: None,
+        summary: Some("长简介。".repeat(120)),
+        douban_url: None,
+      },
+    ];
+    let r = format_clasp_results(&items, false, 3, 2);
+    assert!(r.contains("claspclub 在线书目库"), "应标注在线来源: {r}");
+    assert!(r.contains("\"query_match\":\"exact\""), "{r}");
+    assert!(r.contains("search_books"), "应指引本地检索工具: {r}");
+    assert!(r.contains("\"page\":2"), "{r}");
+    // 简介截断（200 字符 + 省略号，远小于原始 720 字）
+    let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+    let summaries = v["results"].as_array().unwrap();
+    assert!(summaries[1]["summary"].as_str().unwrap().chars().count() <= 201);
+    // fuzzy：无精确匹配的提示
+    let r2 = format_clasp_results(&items[..1], true, 1, 1);
+    assert!(r2.contains("fuzzy"), "{r2}");
+  }
 }

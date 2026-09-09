@@ -151,11 +151,14 @@ pub enum LlmError {
   Api(String),
   #[error("解析响应失败: {0}")]
   Parse(String),
+  /// token 预算已耗尽（不可重试；调整预算或清零用量后恢复）
+  #[error("预算限制: {0}")]
+  Budget(String),
 }
 
 impl LlmError {
   /// 是否值得重试：网络错误与 HTTP 429/5xx（限流/临时故障）；
-  /// 其余（参数错误、鉴权失败等 4xx）重试无意义
+  /// 其余（参数错误、鉴权失败等 4xx、预算超限）重试无意义
   pub fn is_retryable(&self) -> bool {
     match self {
       LlmError::Network(_) => true,
@@ -164,6 +167,7 @@ impl LlmError {
         s.starts_with("HTTP 429") || s.starts_with("HTTP 5")
       }
       LlmError::Parse(_) => false,
+      LlmError::Budget(_) => false,
     }
   }
 }
@@ -234,7 +238,16 @@ pub async fn chat_with_tools_timeout(
   tools: Option<&[serde_json::Value]>,
   timeout: std::time::Duration,
 ) -> Result<ChatOutcome, LlmError> {
-  let retries = crate::config::AppConfig::load()
+  let app_cfg = crate::config::AppConfig::load();
+  // 预算检查（所有 LLM 调用的统一咽喉：chat/融合/翻译/书虫循环都经过这里）。
+  // 用量按次入库，多轮 agent 每轮调用前都会重新检查 → 达到预算自动中断。
+  // 数据库不可读时按 0 用量放行（统计故障不应阻断功能）。
+  if let Some(msg) = app_cfg.llm.budget_error(crate::db::llm_usage_total_at(
+    &app_cfg.database_file(),
+  )) {
+    return Err(LlmError::Budget(msg));
+  }
+  let retries = app_cfg
     .llm
     .retry_count
     .unwrap_or(crate::config::DEFAULT_LLM_RETRY)
@@ -459,5 +472,51 @@ mod tests {
     } else {
       assert!(LlmConfig::resolve(&s).is_some());
     }
+  }
+
+  /// 预算检查：达到/超过预算返回错误信息，未达或未配置预算放行
+  #[test]
+  fn test_budget_error() {
+    let s = LlmSettings { budget_tokens: Some(1000), ..Default::default() };
+    assert!(s.budget_error(999).is_none());
+    let msg = s.budget_error(1000).unwrap();
+    assert!(msg.contains("1000"), "信息应含预算值: {msg}");
+    assert!(s.budget_error(5000).is_some());
+
+    // 未配置预算 / 预算非正数 → 永不放行拦截
+    let s2 = LlmSettings::default();
+    assert!(s2.budget_error(i64::MAX).is_none());
+    let s3 = LlmSettings { budget_tokens: Some(0), ..Default::default() };
+    assert!(s3.budget_error(99999).is_none());
+  }
+
+  /// 预算错误不可重试（重试只会继续撞墙）
+  #[test]
+  fn test_budget_error_not_retryable() {
+    let e = LlmError::Budget("已达上限".into());
+    assert!(!e.is_retryable());
+  }
+
+  /// 模型价格解析：显式配置精确匹配 > 预设最长前缀匹配；未知模型不计成本
+  #[test]
+  fn test_price_for() {
+    use crate::config::ModelPricing;
+    let s = LlmSettings {
+      pricing: vec![ModelPricing {
+        model: "deepseek-chat".into(),
+        input_per_m: 1.5,
+        output_per_m: 6.0,
+      }],
+      ..Default::default()
+    };
+    // 显式配置覆盖预设
+    assert_eq!(s.price_for("deepseek-chat"), Some((1.5, 6.0)));
+    // 用量统计键（provider/model）与裸模型名等价
+    assert_eq!(s.price_for("DeepSeek/deepseek-chat"), Some((1.5, 6.0)));
+    // 预设表：最长前缀命中（gpt-4o-2024-08-06 → gpt-4o，而非 gpt-4）
+    assert_eq!(s.price_for("gpt-4o-2024-08-06"), Some((18.0, 72.0)));
+    assert_eq!(s.price_for("OpenAI/gpt-4o-mini"), Some((1.1, 4.3)));
+    // 未知模型 → None（不计成本）
+    assert_eq!(s.price_for("my-private-model"), None);
   }
 }
