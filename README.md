@@ -137,13 +137,16 @@ cargo tauri build      # 产出安装包（target/release/bundle/）
 ### Android
 
 ```bash
-cargo tauri android init        # 仅首次（本仓库已初始化，可跳过）
+cargo tauri android init        # 仅首次
 cargo tauri android dev         # 真机/模拟器调试
 cargo tauri android build       # 产出 APK/AAB
 ```
 
-> 注意：移动端书库建议放在应用私有目录；访问公共目录需在系统设置中授予
-> "所有文件访问"权限（MANAGE_EXTERNAL_STORAGE）。
+> **移动端存储说明**：
+> - 封面缓存固定存放于**应用私有目录**（`{应用数据目录}/covers`），不会被系统图库收录，也不受书库目录权限影响；
+> - EPUB 仍保存在创建书库时选择的目录。若选择公共存储（如 `/storage/emulated/0/...`），
+>   需在系统设置中授予应用「所有文件访问」权限 —— 同步遇写入失败时会弹窗引导一键跳转授权页；
+> - 不想授予权限的话，把书库目录设为应用私有目录即可（`fs_roots` 中的应用数据目录），无需任何授权。
 
 ### 仅 CLI
 

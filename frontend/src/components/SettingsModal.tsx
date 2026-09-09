@@ -532,7 +532,7 @@ function WebDavPanel({
   // 订阅同步进度事件
   useEffect(() => {
     const un = listen<TaskProgressEvent>("task-progress", (e) => {
-      if (e.payload.phase.startsWith("webdav")) setSyncPhase(e.payload);
+      if (e.payload?.phase?.startsWith("webdav")) setSyncPhase(e.payload);
     });
     return () => {
       un.then((fn) => fn()).catch(() => undefined);
@@ -774,7 +774,13 @@ function WebDavPanel({
                 report.books_deleted > 0) &&
                 `；数据库：入库 ${report.books_imported}，覆盖 ${report.books_updated}，移除 ${report.books_deleted}`}
               {report.failed > 0 ? `，失败 ${report.failed}` : ""}
-              {report.errors.length > 0 ? `；${report.errors.join("；")}` : ""}
+              {report.errors.length > 0
+                ? `；${report.errors[0]}${
+                    report.errors.length > 1
+                      ? `（等 ${report.errors.length} 条错误，详见日志）`
+                      : ""
+                  }`
+                : ""}
             </div>
           )}
           <div className="form-hint">

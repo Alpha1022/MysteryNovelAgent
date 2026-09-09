@@ -50,7 +50,9 @@ a {
 .page {
   max-width: 1240px;
   margin: 0 auto;
-  padding: 40px 8vw 80px;
+  /* 移动端预留系统状态栏/挖孔的安全区，并在其上额外加大基础留白 */
+  padding: calc(52px + env(safe-area-inset-top, 0px)) 8vw
+    calc(88px + env(safe-area-inset-bottom, 0px));
   min-height: 100%;
 }
 
@@ -947,7 +949,9 @@ a {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  /* 安全区：弹窗不被状态栏/手势条遮挡（额外加大基础留白） */
+  padding: calc(32px + env(safe-area-inset-top, 0px)) 24px
+    calc(32px + env(safe-area-inset-bottom, 0px));
 }
 
 .modal {
@@ -1760,7 +1764,7 @@ a {
 .chat-fab {
   position: fixed;
   right: 24px;
-  bottom: 24px;
+  bottom: calc(30px + env(safe-area-inset-bottom, 0px));
   z-index: 80;
   width: 52px;
   height: 52px;
@@ -1790,7 +1794,7 @@ a {
 .chat-panel {
   position: fixed;
   right: 24px;
-  bottom: 88px;
+  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
   z-index: 80;
   width: 470px;
   height: 660px;
@@ -1912,6 +1916,52 @@ a {
 
 .chat-bubble.typing span:nth-child(3) {
   animation-delay: 0.4s;
+}
+
+/* 书虫生成中：实时工具轨迹 + 打断按钮 */
+.chat-thinking-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.chat-thinking-dots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.chat-thinking-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: chatblink 1.2s infinite;
+}
+
+.chat-thinking-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.chat-thinking-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.chat-cancel {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.chat-cancel:hover {
+  color: #d17a6f;
+  border-color: rgba(209, 122, 111, 0.5);
 }
 
 @keyframes chatblink {
@@ -3038,6 +3088,9 @@ a {
   background: var(--bg);
   display: flex;
   flex-direction: column;
+  /* 安全区：头部不被状态栏遮挡、底部按钮不被手势条遮挡（额外加大基础留白） */
+  padding-top: calc(env(safe-area-inset-top, 0px) + 12px);
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
 }
 
 .reader-head {

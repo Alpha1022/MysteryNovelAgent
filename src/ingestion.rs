@@ -1,4 +1,4 @@
-﻿use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -1411,9 +1411,9 @@ pub struct SuggestionMatch {
 /// analyze_epub 的分析结果（供前端确认弹窗展示与编辑）
 #[derive(Debug, Clone)]
 pub struct EpubAnalysis {
-  /// 书名候选：EPUB 内嵌标题优先，文件名兜底；繁体已自动转简体
+  /// 书名：静默匹配命中时优先采用爬取到的（繁转简），否则 EPUB 内嵌标题 → 文件名兜底
   pub title: String,
-  /// EPUB 内嵌作者（可能为空）
+  /// 作者：静默匹配命中时优先采用爬取到的，否则 EPUB 内嵌作者（可能为空）
   pub author: String,
   /// 书名是否含中文（非中文标题必须经前端确认后才可导入）
   pub is_chinese_title: bool,
@@ -1492,9 +1492,29 @@ pub async fn analyze_epub(path: &Path) -> Result<EpubAnalysis, IngestionError> {
   let (items, total) = search_res;
 
   let suggestion = pick_silent_match(&items, &title);
+
+  // 书名/作者优先采用爬取到的（claspclub 静默匹配结果），EPUB 原有值仅兜底；
+  // 爬取到的标题同样做繁转简，非中文标题仍交由前端确认
+  let title = match suggestion.as_ref() {
+    Some(s) if !s.title.trim().is_empty() => {
+      let t = s.title.trim().to_string();
+      if utils::count_han(&t) > 0 {
+        traditional_to_simplified(&t).into_owned()
+      } else {
+        t
+      }
+    }
+    _ => title,
+  };
+  let author = match suggestion.as_ref() {
+    Some(s) if !s.author_name.trim().is_empty() => s.author_name.trim().to_string(),
+    _ => raw_author.clone().unwrap_or_default(),
+  };
+  let is_chinese = utils::count_han(&title) > 0;
+
   Ok(EpubAnalysis {
     title,
-    author: raw_author.unwrap_or_default(),
+    author,
     is_chinese_title: is_chinese,
     // zip 重建副本路径（无需修复时为 None；导入应使用该路径处理）
     effective_path: (effective != path).then_some(effective.clone()),
@@ -2074,17 +2094,7 @@ pub async fn prepare_import(
     meta.series_order = order;
   }
 
-  // 作者：多选合并时取并集去重（用户未自定义作者时生效）
-  if meta.author.trim().is_empty() {
-    let mut authors: Vec<String> = Vec::new();
-    for m in &match_list {
-      let a = m.author.trim();
-      if !a.is_empty() && !authors.iter().any(|x| x == a) {
-        authors.push(a.to_string());
-      }
-    }
-    meta.author = authors.join("、");
-  }
+  // 作者/书名的爬取优先回填统一在豆瓣来源爬取完成后进行（见下方"元数据回填"）
 
   // 阶段二：豆瓣链接集合 = 手动填写（优先）+ clasp 推断，去重
   let mut douban_list: Vec<String> = Vec::new();
@@ -2126,29 +2136,18 @@ pub async fn prepare_import(
     douban_sources.push(ps);
   }
 
-  // 元数据回填：书名/作者为空时按 claspclub → 豆瓣 首来源补齐（豆瓣页面抓取的书名作者）
-  if meta.title.trim().is_empty() {
-    meta.title = clasp_sources
-      .iter()
-      .find_map(|s| s.title.clone().filter(|t| !t.trim().is_empty()))
-      .or_else(|| {
-        douban_sources
-          .iter()
-          .find_map(|s| s.title.clone().filter(|t| !t.trim().is_empty()))
-      })
-      .unwrap_or_default();
-  }
-  if meta.author.trim().is_empty() {
-    meta.author = clasp_sources
-      .iter()
-      .find_map(|s| s.author.clone().filter(|t| !t.trim().is_empty()))
-      .or_else(|| {
-        douban_sources
-          .iter()
-          .find_map(|s| s.author.clone().filter(|t| !t.trim().is_empty()))
-      })
-      .unwrap_or_default();
-  }
+  // 元数据回填：书名/作者优先采用爬取到的，EPUB 原有值仅作兜底。
+  // 此处入参来自确认弹窗前的预填（GUI 在 prepare 之后才允许编辑），
+  // 用户编辑值由 commit_import 在最终落盘时覆盖，不受影响。
+  let (title, author) = crawled_title_author(
+    &meta.title,
+    &meta.author,
+    &clasp_sources,
+    &match_list,
+    &douban_sources,
+  );
+  meta.title = title;
+  meta.author = author;
 
   // 阶段四：简介定稿（clasp 简介 → 豆瓣简介兜底；多条按"确认合并 / 取第一本"）
   let desc_source = if clasp_summaries.is_empty() { &douban_summaries } else { &clasp_summaries };
@@ -2291,6 +2290,77 @@ pub fn finalize_import(
   info!("EPUB 元数据写入成功");
   p.library_file = library_file;
   Ok(())
+}
+
+/// 导入元数据回填（GUI prepare_import 用）：书名/作者优先采用爬取到的，
+/// EPUB 原有值（调用方传入的 current_*）仅作兜底。
+///
+/// - 书名：clasp 详情 → 搜索条目首条 → 豆瓣首来源；含汉字时繁转简（数据不变量）
+/// - 作者：clasp 来源并集（合并本多作者顿号拼接）→ 搜索条目并集 → 豆瓣首来源
+/// - 全部来源都爬取失败时保留原值（降级不阻断）
+pub fn crawled_title_author(
+  current_title: &str,
+  current_author: &str,
+  clasp_sources: &[PendingSource],
+  match_list: &[&SuggestionMatch],
+  douban_sources: &[PendingSource],
+) -> (String, String) {
+  use character_converter::traditional_to_simplified;
+
+  let mut title = current_title.to_string();
+  let crawled_title = clasp_sources
+    .iter()
+    .find_map(|s| s.title.clone().filter(|t| !t.trim().is_empty()))
+    .or_else(|| {
+      match_list
+        .first()
+        .map(|m| m.title.trim().to_string())
+        .filter(|t| !t.is_empty())
+    })
+    .or_else(|| {
+      douban_sources
+        .iter()
+        .find_map(|s| s.title.clone().filter(|t| !t.trim().is_empty()))
+    });
+  if let Some(t) = crawled_title {
+    title = if utils::count_han(&t) > 0 {
+      traditional_to_simplified(&t).into_owned()
+    } else {
+      t
+    };
+  }
+
+  let mut authors: Vec<String> = Vec::new();
+  let push_author = |a: &str, out: &mut Vec<String>| {
+    let a = a.trim();
+    if !a.is_empty() && !out.iter().any(|x| x == a) {
+      out.push(a.to_string());
+    }
+  };
+  for s in clasp_sources {
+    if let Some(a) = s.author.as_deref() {
+      push_author(a, &mut authors);
+    }
+  }
+  if authors.is_empty() {
+    for m in match_list {
+      push_author(&m.author, &mut authors);
+    }
+  }
+  if authors.is_empty() {
+    if let Some(a) = douban_sources
+      .iter()
+      .find_map(|s| s.author.clone().filter(|a| !a.trim().is_empty()))
+    {
+      push_author(&a, &mut authors);
+    }
+  }
+  let author = if authors.is_empty() {
+    current_author.to_string()
+  } else {
+    authors.join("、")
+  };
+  (title, author)
 }
 
 /// 系列继承规则（导入时）：若所有 clasp 来源条目的系列名一致，则自动取为书籍系列。
@@ -2586,6 +2656,79 @@ mod tests {
       inherit_series(&[("馆系列".into(), Some(5)), ("伽利略系列".into(), Some(5))]),
       None
     );
+  }
+
+  /// 爬取优先回填：书名/作者优先采用爬取到的，EPUB 原值仅兜底
+  #[test]
+  fn test_crawled_title_author() {
+    let clasp = |title: Option<&str>, author: Option<&str>| PendingSource {
+      ref_key: String::new(),
+      title: title.map(str::to_string),
+      author: author.map(str::to_string),
+      ..Default::default()
+    };
+    let m = |title: &str, author: &str| SuggestionMatch {
+      id: String::new(),
+      title: title.to_string(),
+      author: author.to_string(),
+      tags: vec![],
+      cover_url: None,
+      summary: None,
+      douban_url: None,
+    };
+
+    // 单条 clasp 来源：覆盖 EPUB 原值；繁体书名自动转简体（作者不转换，与 CLI 一致）
+    let (t, a) = crawled_title_author(
+      "EPUB旧标题",
+      "EPUB旧作者",
+      &[clasp(Some("鐘錶館事件"), Some("綾辻行人"))],
+      &[],
+      &[],
+    );
+    assert_eq!(t, "钟表馆事件");
+    assert_eq!(a, "綾辻行人");
+
+    // 合并本：作者取 clasp 来源并集（顿号拼接、去重）
+    let (t, a) = crawled_title_author(
+      "",
+      "",
+      &[clasp(Some("馆系列合集"), Some("绫辻行人")), clasp(None, Some("绫辻行人"))],
+      &[],
+      &[],
+    );
+    assert_eq!(t, "馆系列合集");
+    assert_eq!(a, "绫辻行人");
+
+    // clasp 详情全失败 → 搜索条目兜底（标题 + 作者并集）
+    let (t, a) = crawled_title_author(
+      "EPUB标题",
+      "EPUB作者",
+      &[clasp(None, None)],
+      &[&m("搜索标题", "作者甲"), &m("搜索标题2", "作者乙")],
+      &[],
+    );
+    assert_eq!(t, "搜索标题");
+    assert_eq!(a, "作者甲、作者乙");
+
+    // 无 clasp 匹配（跳过搜索走豆瓣）：豆瓣首来源覆盖
+    let (t, a) = crawled_title_author(
+      "EPUB标题",
+      "",
+      &[],
+      &[],
+      &[clasp(Some("豆瓣标题"), Some("豆瓣作者"))],
+    );
+    assert_eq!(t, "豆瓣标题");
+    assert_eq!(a, "豆瓣作者");
+
+    // 全部来源为空 → 保留 EPUB 原值（降级不阻断）
+    let (t, a) = crawled_title_author("EPUB标题", "EPUB作者", &[], &[], &[]);
+    assert_eq!(t, "EPUB标题");
+    assert_eq!(a, "EPUB作者");
+
+    // 非中文爬取书名原样保留（由前端确认）
+    let (t, _) = crawled_title_author("EPUB标题", "", &[clasp(Some("Murder on the Links"), None)], &[], &[]);
+    assert_eq!(t, "Murder on the Links");
   }
 
   /// persist_import：books + 增强元数据 + 来源项目 + 短评 + LLM 用量一次性写入内存库

@@ -83,13 +83,26 @@ export function switchLibrary(id: string): Promise<string> {
 }
 
 /** Chatbot 对话（系统提示由后端按数据库实时构建） */
-export function chatbotChat(messages: ChatMessage[]): Promise<ChatReply> {
-  return invoke("chatbot_chat", { messages });
+/** 书虫对话（agent 循环；进度经 chat-progress 事件实时推送，task_id 供打断） */
+export function chatbotChat(messages: ChatMessage[], taskId?: string): Promise<ChatReply> {
+  return invoke("chatbot_chat", { messages, taskId });
 }
 
 /** 分析 EPUB（提取元数据 + claspclub 静默匹配） */
 export function analyzeEpub(path: string): Promise<EpubPreview> {
   return invoke("analyze_epub", { path });
+}
+
+/**
+ * 保存 HTML5 拖入的文件内容到临时文件（WebView 拿不到本地路径，只能读字节）
+ *
+ * 字节走 IPC 原始请求体（大文件避免 JSON 数组序列化）；文件名经
+ * encodeURIComponent 放在请求头（HTTP 头不允许非 ASCII）。返回临时文件路径。
+ */
+export function saveDroppedFile(filename: string, bytes: Uint8Array): Promise<string> {
+  return invoke("save_dropped_file", bytes, {
+    headers: { filename: encodeURIComponent(filename) },
+  });
 }
 
 /** 确认导入（批量自动导入快速路径）：预处理 → 落盘 → 入库一次完成 */
@@ -362,6 +375,16 @@ export function webdavTest(wd: WebDavCfg, name: string): Promise<string> {
 /** 打断一个进行中的 WebDav 同步任务 */
 export function cancelSyncTask(taskId: string): Promise<boolean> {
   return invoke("cancel_sync_task", { taskId });
+}
+
+/** 是否已授予「所有文件访问」权限（Android 11+ 检测；桌面端恒 true） */
+export function hasStoragePermission(): Promise<boolean> {
+  return invoke("has_all_files_access");
+}
+
+/** 打开本应用的「所有文件访问」系统授权页（仅移动端有效；用户开关后返回重试同步） */
+export function openStoragePermissionSettings(): Promise<void> {
+  return invoke("open_all_files_access_settings");
 }
 
 /** 同步到云端：本地书库完整覆盖云端（EPUB + covers + 数据库快照）；进度经 task-progress 推送 */

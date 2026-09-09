@@ -56,13 +56,12 @@ impl SyncCancel {
   }
 }
 
-/// 同步进度（GUI 通过 task-progress 事件实时渲染）
+/// 同步进度（GUI 通过 task-progress 事件实时渲染；字段与前端 TaskProgressEvent 对齐）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncProgress {
-  /// 方向：push（同步到云端）/ pull（从云端同步）
-  pub direction: String,
-  /// 阶段：epub / covers / db
-  pub stage: String,
+  /// 事件类型前缀：webdav-push（同步到云端）/ webdav-pull（从云端同步），
+  /// 具体动作与文件名见 message
+  pub phase: String,
   pub current: i64,
   pub total: i64,
   pub message: String,
@@ -99,14 +98,22 @@ pub struct LibrarySyncCtx<'a> {
   pub library_id: &'a str,
   /// 书库名（远程子目录名，[A-Za-z0-9_]）
   pub name: &'a str,
-  /// 本地书库根目录
+  /// 本地书库根目录（EPUB 存放处）
   pub library_dir: &'a Path,
+  /// 封面缓存目录（移动端为应用私有目录，可与书库目录不同）
+  pub covers_dir: PathBuf,
   /// 云端无数据库快照时的降级登记标签
   pub default_tags: &'a [String],
 }
 
 /// 校验书库可同步并构建上下文（推送/拉取共用入口校验）
-pub fn ensure_ctx(lib: &crate::config::LibraryConfig) -> anyhow::Result<LibrarySyncCtx<'_>> {
+///
+/// `covers_dir` 由调用方经 `AppConfig::covers_dir()` 取得
+/// （移动端为应用私有目录，桌面端为 `{library_path}/covers`）。
+pub fn ensure_ctx(
+  lib: &crate::config::LibraryConfig,
+  covers_dir: PathBuf,
+) -> anyhow::Result<LibrarySyncCtx<'_>> {
   if !lib.webdav.enabled {
     anyhow::bail!("该书库未启用 WebDav 同步，请先在 WebDav 页签启用并保存");
   }
@@ -117,6 +124,7 @@ pub fn ensure_ctx(lib: &crate::config::LibraryConfig) -> anyhow::Result<LibraryS
     library_id: &lib.id,
     name: &lib.name,
     library_dir: &lib.path,
+    covers_dir,
     default_tags: &lib.default_tags,
   })
 }
@@ -424,6 +432,23 @@ fn with_local_db<T>(f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow:
   f(&conn)
 }
 
+/// 校验目录可写：写入并删除一个 1 字节测试文件
+///
+/// Android 上书库目录位于公共存储但未授予「所有文件访问」时，
+/// 读目录可能成功而写文件失败（EPUB/封面逐个下载失败但数据库正常——
+/// 数据库走应用私有 cache 目录）。下载前预检可立即给出可操作的错误。
+fn ensure_dir_writable(dir: &Path) -> anyhow::Result<()> {
+  let test = dir.join(".mna-write-test");
+  std::fs::write(&test, b"x").map_err(|e| {
+    anyhow!(
+      "书库目录不可写: {}（{e}）\n请在系统设置中授予「所有文件访问」权限，或将书库目录设为应用私有目录",
+      dir.display()
+    )
+  })?;
+  let _ = std::fs::remove_file(&test);
+  Ok(())
+}
+
 /// 列取本地书库目录中的 EPUB 文件（名称升序）
 fn collect_local_epubs(dir: &Path) -> anyhow::Result<Vec<(String, PathBuf, u64)>> {
   let mut out = Vec::new();
@@ -530,19 +555,18 @@ pub async fn push_library(
   let local_names: HashSet<String> = local_files.iter().map(|(n, _, _)| n.clone()).collect();
 
   // 进度：EPUB + covers + 数据库快照
-  let covers_dir = ctx.library_dir.join(COVERS_DIR);
-  let _ = std::fs::create_dir_all(&covers_dir);
-  crate::config::ensure_nomedia(&covers_dir);
-  // 旧版 covers_path 独立配置目录中的封面一并推送（与书库 covers 目录求并集）
+  let covers_dir = &ctx.covers_dir;
+  let _ = std::fs::create_dir_all(covers_dir);
+  crate::config::ensure_nomedia(covers_dir);
+  // 旧版 covers_path 独立配置目录中的封面一并推送（与主封面目录求并集）
   let alt_covers = crate::config::AppConfig::load().covers_path;
-  let local_covers = collect_push_covers(&covers_dir, alt_covers.as_deref());
+  let local_covers = collect_push_covers(covers_dir, alt_covers.as_deref());
   let total = (local_files.len() + local_covers.len() + 1) as i64;
   let mut current: i64 = 0;
-  let mut emit = |stage: &str, message: String| {
+  let mut emit = |_stage: &str, message: String| {
     current += 1;
     progress(SyncProgress {
-      direction: "push".into(),
-      stage: stage.into(),
+      phase: "webdav-push".into(),
       current,
       total,
       message,
@@ -564,12 +588,14 @@ pub async fn push_library(
         }
         Err(e) => {
           report.failed += 1;
+          warn!("WebDav 推送失败: {name}: 上传失败 {e}");
           report.errors.push(format!("{name}: 上传失败 {e}"));
           emit("epub", format!("上传失败 {name}"));
         }
       },
       Err(e) => {
         report.failed += 1;
+        warn!("WebDav 推送失败: {name}: 读取失败 {e}");
         report.errors.push(format!("{name}: 读取失败 {e}"));
         emit("epub", format!("读取失败 {name}"));
       }
@@ -589,6 +615,7 @@ pub async fn push_library(
       }
       Err(e) => {
         report.failed += 1;
+        warn!("WebDav 推送删除失败: {name}: {e}");
         report.errors.push(format!("{name}: 远端删除失败 {e}"));
         emit("epub", format!("删除失败 {name}"));
       }
@@ -612,12 +639,14 @@ pub async fn push_library(
         }
         Err(e) => {
           report.failed += 1;
+          warn!("WebDav 推送失败: {COVERS_DIR}/{name}: 上传失败 {e}");
           report.errors.push(format!("{COVERS_DIR}/{name}: 上传失败 {e}"));
           emit("covers", format!("上传失败封面 {name}"));
         }
       },
       Err(e) => {
         report.failed += 1;
+        warn!("WebDav 推送失败: {COVERS_DIR}/{name}: 读取失败 {e}");
         report.errors.push(format!("{COVERS_DIR}/{name}: 读取失败 {e}"));
         emit("covers", format!("读取失败封面 {name}"));
       }
@@ -636,6 +665,7 @@ pub async fn push_library(
       }
       Err(e) => {
         report.failed += 1;
+        warn!("WebDav 推送删除失败: {COVERS_DIR}/{name}: {e}");
         report.errors.push(format!("{COVERS_DIR}/{name}: 远端删除失败 {e}"));
         emit("covers", format!("删除失败封面 {name}"));
       }
@@ -649,6 +679,7 @@ pub async fn push_library(
     Ok(()) => report.uploaded += 1,
     Err(e) => {
       report.failed += 1;
+      warn!("WebDav 推送失败: {DB_FILE_NAME}: 上传失败 {e}");
       report.errors.push(format!("{DB_FILE_NAME}: 上传失败 {e}"));
     }
   }
@@ -724,18 +755,22 @@ pub async fn pull_library(
 
   let mut report = SyncReport::default();
   report.total = remote_files.len();
-  let covers_dir = ctx.library_dir.join(COVERS_DIR);
-  let _ = std::fs::create_dir_all(&covers_dir);
-  crate::config::ensure_nomedia(&covers_dir);
+  let covers_dir = &ctx.covers_dir;
+  let _ = std::fs::create_dir_all(covers_dir);
+  crate::config::ensure_nomedia(covers_dir);
+
+  // 下载前预检目标目录可写（EPUB 写书库目录、封面写封面目录；
+  // Android 公共存储未授权时逐文件写入必然失败）
+  ensure_dir_writable(ctx.library_dir)?;
+  ensure_dir_writable(covers_dir)?;
 
   // 进度：云端 EPUB + covers + 数据库覆盖
   let total = (remote_files.len() + remote_covers.len() + 1) as i64;
   let mut current: i64 = 0;
-  let mut emit = |stage: &str, message: String| {
+  let mut emit = |_stage: &str, message: String| {
     current += 1;
     progress(SyncProgress {
-      direction: "pull".into(),
-      stage: stage.into(),
+      phase: "webdav-pull".into(),
       current,
       total,
       message,
@@ -761,7 +796,9 @@ pub async fn pull_library(
       }
       Err(e) => {
         report.failed += 1;
-        report.errors.push(format!("{COVERS_DIR}/{name}: 下载失败 {e}"));
+        let msg = format!("{COVERS_DIR}/{name}: 下载失败 {e}");
+        warn!("WebDav 拉取失败: {msg}");
+        report.errors.push(msg);
         emit("covers", format!("下载失败封面 {name}"));
       }
     }
@@ -788,7 +825,9 @@ pub async fn pull_library(
       }
       Err(e) => {
         report.failed += 1;
-        report.errors.push(format!("{name}: 下载失败 {e}"));
+        let msg = format!("{name}: 下载失败 {e}");
+        warn!("WebDav 拉取失败: {msg}");
+        report.errors.push(msg);
         emit("epub", format!("下载失败 {name}"));
       }
     }
@@ -805,6 +844,7 @@ pub async fn pull_library(
       }
       Err(e) => {
         report.failed += 1;
+        warn!("WebDav 拉取删除失败: {name}: {e}");
         report.errors.push(format!(
           "{name}: 本地删除失败 {e}（文件可能正被阅读器占用）"
         ));
@@ -861,7 +901,10 @@ pub async fn pull_library(
           report.errors.push("云端数据库缓存写入失败".into());
         }
       }
-      Err(e) => report.errors.push(format!("{DB_FILE_NAME}: 下载失败 {e}")),
+      Err(e) => {
+        warn!("WebDav 拉取失败: {DB_FILE_NAME}: 下载失败 {e}");
+        report.errors.push(format!("{DB_FILE_NAME}: 下载失败 {e}"))
+      }
     }
   }
   // 云端无快照或覆盖失败：降级为骨架登记（幂等，不覆盖已有书籍数据）
@@ -982,11 +1025,11 @@ mod tests {
       },
     };
     // 书库名含连字符 → 非法（仅大小写字母/数字/下划线）
-    assert!(ensure_ctx(&lib).is_err());
+    assert!(ensure_ctx(&lib, std::env::temp_dir()).is_err());
     lib.name = "default".into();
-    assert!(ensure_ctx(&lib).is_ok());
+    assert!(ensure_ctx(&lib, std::env::temp_dir()).is_ok());
     // 未启用 → 拒绝
     lib.webdav.enabled = false;
-    assert!(ensure_ctx(&lib).is_err());
+    assert!(ensure_ctx(&lib, std::env::temp_dir()).is_err());
   }
 }

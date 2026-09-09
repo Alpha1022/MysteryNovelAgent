@@ -4,9 +4,10 @@ frontend/dist/
 *.db
 release/
 
-# Android：仅忽略构建产物；gen/android 工程骨架保留在仓库中，
-# 克隆后无需 cargo tauri android init 即可构建（构建产物由 gen 内 .gitignore 排除）
-src-tauri/gen/schemas/
+src-tauri/gen/
 
 # 个人 AI 开发工具配置（不随仓库分发）
 opencode.json
+
+# 课程展示课件（不随仓库分发）
+presentation/

@@ -220,6 +220,20 @@ pub async fn chat_with_tools(
   messages: &[Message],
   tools: Option<&[serde_json::Value]>,
 ) -> Result<ChatOutcome, LlmError> {
+  chat_with_tools_timeout(config, messages, tools, std::time::Duration::from_secs(30)).await
+}
+
+/// 同 [`chat_with_tools`]，但可指定单次请求的整体超时
+///
+/// 书虫 agent 循环应传更长超时（如 120 秒）：大书库的系统提示可达数十 KB，
+/// 生成耗时随提示规模上涨，30 秒极易触发 reqwest 超时
+/// （表现为「网络错误: error sending request for url (…/chat/completions)」）。
+pub async fn chat_with_tools_timeout(
+  config: &LlmConfig,
+  messages: &[Message],
+  tools: Option<&[serde_json::Value]>,
+  timeout: std::time::Duration,
+) -> Result<ChatOutcome, LlmError> {
   let retries = crate::config::AppConfig::load()
     .llm
     .retry_count
@@ -227,7 +241,7 @@ pub async fn chat_with_tools(
     .min(10) as usize;
   let mut attempt = 0usize;
   loop {
-    match chat_once(config, messages, tools).await {
+    match chat_once(config, messages, tools, timeout).await {
       Ok(outcome) => return Ok(outcome),
       Err(e) if e.is_retryable() && attempt < retries => {
         attempt += 1;
@@ -244,10 +258,9 @@ async fn chat_once(
   config: &LlmConfig,
   messages: &[Message],
   tools: Option<&[serde_json::Value]>,
+  timeout: std::time::Duration,
 ) -> Result<ChatOutcome, LlmError> {
-  let client = reqwest::Client::builder()
-    .timeout(std::time::Duration::from_secs(30))
-    .build()?;
+  let client = reqwest::Client::builder().timeout(timeout).build()?;
 
   let req = ChatRequest {
     model: config.model.clone(),

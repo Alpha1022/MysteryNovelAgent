@@ -136,7 +136,7 @@ export default function AddBookModal({
     });
   };
 
-  /** 搜索步预填：合并多选标签与作者 */
+  /** 搜索步预填：书名/作者优先采用爬取到的（所选匹配条目），EPUB 原值仅兜底；合并多选标签与作者 */
   const prefillFromSelection = () => {
     const first = selected[0];
     const tagUnion: string[] = [];
@@ -151,8 +151,8 @@ export default function AddBookModal({
       if (a && !authors.includes(a)) authors.push(a);
     }
     return {
-      title: preview.title.trim() || first?.title || preview.title.trim(),
-      author: preview.author.trim() || authors.join("、"),
+      title: first?.title.trim() || preview.title.trim(),
+      author: authors.join("、") || preview.author.trim(),
       tags: first ? ensureMysteryTag(tagUnion, defaultTags) : [],
     };
   };

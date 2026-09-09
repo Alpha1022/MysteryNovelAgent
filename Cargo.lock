@@ -2581,6 +2581,7 @@ version = "0.1.0"
 dependencies = [
  "dunce",
  "mystery-novel-agent",
+ "percent-encoding",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2588,7 +2589,9 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

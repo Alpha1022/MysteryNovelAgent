@@ -355,17 +355,24 @@ impl AppConfig {
     Ok(p)
   }
 
-  /// 获取封面缓存目录，默认 `{library_path}/covers`
+  /// 获取封面缓存目录：
+  /// - 显式 `covers_path` 配置优先；
+  /// - 移动端（数据目录覆盖生效时）使用应用私有目录 `{data_dir}/covers`：
+  ///   避免公共存储中的封面被图库收录，也不受书库目录（可能只读）的权限限制；
+  /// - 桌面端回退 `{library_path}/covers`。
   pub fn covers_dir(&self) -> anyhow::Result<PathBuf> {
-    match &self.covers_path {
-      Some(p) => Ok(p.clone()),
-      None => {
-        let lib = self.require_library_path()?;
-        let dir = lib.join("covers");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-      }
+    if let Some(p) = &self.covers_path {
+      return Ok(p.clone());
     }
+    if let Some(base) = data_dir_override() {
+      let dir = base.join("covers");
+      std::fs::create_dir_all(&dir)?;
+      return Ok(dir);
+    }
+    let lib = self.require_library_path()?;
+    let dir = lib.join("covers");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
   }
 
   /// 数据库文件绝对路径：优先使用配置值；

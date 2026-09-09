@@ -12,6 +12,79 @@ use mystery_novel_agent::{agent, db, ingestion, merge, spider, utils};
 /// 取消返回的固定错误标记（前端据此与真实错误区分）
 const CANCELLED_MSG: &str = "任务已取消";
 
+/// 前端诊断日志转发（写入 app.log，排查滚动/拖拽等问题时在前端加一行即可）
+#[tauri::command]
+pub fn debug_log(msg: String) {
+  tracing::info!("[frontend] {msg}");
+}
+
+/// 拖入文件的临时落盘目录（HTML5 拖拽导入；内容并入书库后副本无保留价值）
+pub fn drag_import_dir() -> std::path::PathBuf {
+  mystery_novel_agent::config::temp_dir().join("drag-import")
+}
+
+/// 启动清扫：上一会话遗留的拖入临时文件（导入流程已复制入库，副本可删）
+pub fn cleanup_drag_import_dir() {
+  use tracing::warn;
+  let dir = drag_import_dir();
+  if dir.exists() {
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+      warn!("清扫拖入临时目录失败: {e}");
+    }
+  }
+}
+
+/// 保存前端 HTML5 拖拽导入的文件内容到临时目录
+///
+/// WebView 的 HTML5 drop 事件拿不到本地路径（安全限制，只有文件内容），
+/// 因此前端读出字节经 IPC 原始请求体传给本命令落盘，返回临时文件路径后
+/// 复用既有的 analyze_epub / 批量导入流程。
+/// 文件名经 encodeURIComponent 后放在 "filename" 请求头（HTTP 头不允许非 ASCII）。
+#[tauri::command]
+pub fn save_dropped_file(request: tauri::ipc::Request) -> Result<String, String> {
+  use percent_encoding::percent_decode_str;
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  // 文件名：URL 解码 → 仅保留 basename → 剔除 Windows 非法字符（防御性处理）
+  let raw_name = request
+    .headers()
+    .get("filename")
+    .and_then(|v| v.to_str().ok())
+    .map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned())
+    .unwrap_or_default();
+  let basename = raw_name.rsplit(['/', '\\']).next().unwrap_or_default();
+  let sanitized: String = basename
+    .chars()
+    .map(|c| {
+      if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+        '_'
+      } else {
+        c
+      }
+    })
+    .collect();
+  let filename = if sanitized.trim().is_empty() {
+    "dropped.epub".to_string()
+  } else {
+    sanitized
+  };
+
+  let bytes = match request.body() {
+    tauri::ipc::InvokeBody::Raw(b) if !b.is_empty() => b,
+    tauri::ipc::InvokeBody::Raw(_) => return Err("拖入的文件内容为空".into()),
+    // JSON 主体：非原始字节通道（理论上仅 Android postMessage 路径），拖拽不支持
+    _ => return Err("拖入内容编码不受支持".into()),
+  };
+
+  static SEQ: AtomicU64 = AtomicU64::new(0);
+  let dir = drag_import_dir();
+  std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+  let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+  let path = dir.join(format!("{}-{seq}-{filename}", unix_secs()));
+  std::fs::write(&path, bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
+  Ok(path.to_string_lossy().into_owned())
+}
+
 /// 待确认的导入会话（prepare 与 commit 之间暂存爬取产物）
 #[derive(Default)]
 pub struct ImportCache(Mutex<HashMap<String, ingestion::PreparedImport>>);
@@ -510,7 +583,9 @@ async fn run_webdav_sync(
   if cfg.current_library.as_deref() != Some(lib.id.as_str()) {
     return Err("仅允许同步当前书库（请先在设置中切换到该书库）".into());
   }
-  let ctx = mystery_novel_agent::webdav::ensure_ctx(&lib).map_err(|e| e.to_string())?;
+  // 封面缓存目录（移动端为应用私有目录，避免被图库收录且不受书库目录权限限制）
+  let covers_dir = cfg.covers_dir().map_err(|e| e.to_string())?;
+  let ctx = mystery_novel_agent::webdav::ensure_ctx(&lib, covers_dir).map_err(|e| e.to_string())?;
 
   let cancel = task_id
     .as_deref()
@@ -2542,19 +2617,34 @@ fn truncate_for_prompt(s: &str, max: usize) -> String {
 }
 
 /// 构建 Chatbot 系统提示：注入当前书库、书籍、简介与短评知识 + 工具使用指引
+///
+/// 注入量刻意克制（书 40 本、简介/短评/书评截断）：系统提示随书库规模线性膨胀，
+/// 过长的 prompt 会显著拉长生成耗时甚至触发网关重置连接
+/// （表现为「网络错误: error sending request for url (…/chat/completions)」）。
+/// 更多细节由模型经 search_books / get_book_detail 等工具按需检索。
 fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -> String {
+  const CHATBOT_KNOWLEDGE_BOOKS: usize = 40;
   let cfg = AppConfig::load();
   let lib_title = cfg
     .current_library()
     .map(|l| l.title.clone())
     .unwrap_or_else(|| "未命名书库".into());
-  let books = db::search_chatbot_books(conn, library_id, None, None, None, None, 100)
+  let books =
+    db::search_chatbot_books(
+      conn,
+      library_id,
+      None,
+      None,
+      None,
+      None,
+      CHATBOT_KNOWLEDGE_BOOKS as i64,
+    )
     .unwrap_or_default();
 
   let mut knowledge = String::new();
   for (i, b) in books.iter().enumerate() {
-    if i >= 100 {
-      knowledge.push_str(&format!("…（其余 {} 本省略，可用工具检索）\n", books.len() - 100));
+    if i >= CHATBOT_KNOWLEDGE_BOOKS {
+      knowledge.push_str(&format!("…（其余 {} 本省略，可用工具检索）\n", books.len() - CHATBOT_KNOWLEDGE_BOOKS));
       break;
     }
     knowledge.push_str(&format!(
@@ -2571,15 +2661,15 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
       knowledge.push_str(&format!("  标签：{}\n", b.tags));
     }
     if let Some(d) = b.description.as_deref().filter(|s| !s.trim().is_empty()) {
-      knowledge.push_str(&format!("  简介：{}\n", truncate_for_prompt(d, 160)));
+      knowledge.push_str(&format!("  简介：{}\n", truncate_for_prompt(d, 80)));
     }
-    if let Ok(cs) = db::get_top_comments(conn, b.id, 2) {
+    if let Ok(cs) = db::get_top_comments(conn, b.id, 1) {
       for c in cs {
-        knowledge.push_str(&format!("  短评：{}\n", truncate_for_prompt(&c, 80)));
+        knowledge.push_str(&format!("  短评：{}\n", truncate_for_prompt(&c, 60)));
       }
     }
     if let Some(r) = b.my_review.as_deref().filter(|s| !s.trim().is_empty()) {
-      knowledge.push_str(&format!("  我的书评：{}\n", truncate_for_prompt(r, 100)));
+      knowledge.push_str(&format!("  我的书评：{}\n", truncate_for_prompt(r, 60)));
     }
   }
 
@@ -2784,14 +2874,25 @@ fn execute_chatbot_tool(
 /// Chatbot 对话：系统提示按数据库实时构建；支持工具调用 agent 循环
 /// （模型可主动检索本地书库，最多 CHATBOT_MAX_ROUNDS 轮工具调用）
 ///
-/// 回复携带 steps：本次任务实际发生的工具调用轨迹（工具名 + 实参 + 结果），
-/// 前端以可折叠记录展示，避免黑盒。
+/// - 回复携带 steps：本次任务实际发生的工具调用轨迹（工具名 + 实参 + 结果），
+///   前端以可折叠记录展示，避免黑盒
+/// - 实时性：每执行完一个工具即推送 `chat-progress` 事件（携带当前 steps），
+///   前端在生成期间同步展示工具调用记录，而非只放动画
+/// - 可打断：task_id 注册取消令牌（TaskRegistry），前端「打断」按钮经
+///   cancel_task 中断整个思考过程（含进行中的 LLM 请求）
 #[tauri::command]
 pub async fn chatbot_chat(
   state: State<'_, Mutex<rusqlite::Connection>>,
+  registry: State<'_, TaskRegistry>,
+  app: tauri::AppHandle,
   messages: Vec<ChatMessageDto>,
+  task_id: Option<String>,
 ) -> Result<ChatReplyDto, String> {
   const CHATBOT_MAX_ROUNDS: usize = 5;
+  /// 单次 LLM 请求超时：agent 循环的 prompt 含数十 KB 系统提示，30s 极易超时
+  const CHATBOT_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+  /// 历史消息上限（超出时保留最近的，控制每轮请求体积）
+  const CHATBOT_HISTORY_MAX: usize = 16;
 
   if messages.is_empty() {
     return Err("消息不能为空".into());
@@ -2800,20 +2901,38 @@ pub async fn chatbot_chat(
     .ok_or_else(|| "未配置 LLM（请在设置页配置后重试）".to_string())?;
   let lib_id = AppConfig::load().current_library_id().map(str::to_string);
 
+  let cancel = task_id
+    .as_deref()
+    .map(|id| register_task(&registry, id))
+    .unwrap_or_default();
+  let finish = |registry: &TaskRegistry| finish_task(registry, task_id.as_deref());
+
+  // 实时进度：携带当前完整工具轨迹推送给前端
+  let emitter = app.clone();
+  let progress = {
+    let emitter = emitter.clone();
+    move |steps: &[ChatStepDto]| {
+      let _ = emitter.emit("chat-progress", serde_json::json!({ "steps": steps }));
+    }
+  };
+
   // 系统提示（短暂持锁读取 DB）
   let system = {
     let conn = state.lock().map_err(|e| e.to_string())?;
     build_chatbot_system(&conn, lib_id.as_deref())
   };
-  // 消息序列：system → user/assistant 交替（忽略前端传入的 system）
-  let mut msgs: Vec<agent::Message> = vec![agent::Message::system(system)];
-  for m in messages
+  // 消息序列：system → user/assistant 交替（忽略前端传入的 system）；
+  // 历史超限时只保留最近的 CHATBOT_HISTORY_MAX 条，控制每轮请求体积
+  let history: Vec<ChatMessageDto> = messages
     .into_iter()
     .filter(|m| m.role == "user" || m.role == "assistant")
-  {
+    .collect();
+  let history_start = history.len().saturating_sub(CHATBOT_HISTORY_MAX);
+  let mut msgs: Vec<agent::Message> = vec![agent::Message::system(system)];
+  for m in &history[history_start..] {
     msgs.push(agent::Message {
-      role: m.role,
-      content: m.content,
+      role: m.role.clone(),
+      content: m.content.clone(),
       tool_calls: None,
       tool_call_id: None,
     });
@@ -2825,14 +2944,27 @@ pub async fn chatbot_chat(
   let mut steps: Vec<ChatStepDto> = Vec::new();
 
   loop {
-    let outcome = if tools_enabled {
-      agent::chat_with_tools(&config, &msgs, Some(&tools)).await
+    if cancel.is_cancelled() {
+      finish(&registry);
+      return Err(CANCELLED_MSG.into());
+    }
+    // LLM 调用与取消信号竞速：打断时中止进行中的请求
+    let call = if tools_enabled {
+      agent::chat_with_tools_timeout(&config, &msgs, Some(&tools), CHATBOT_LLM_TIMEOUT)
     } else {
-      agent::chat(&config, &msgs).await
+      agent::chat_with_tools_timeout(&config, &msgs, None, CHATBOT_LLM_TIMEOUT)
+    };
+    let outcome = tokio::select! {
+      r = call => r,
+      _ = cancel.wait_cancelled() => Err(agent::LlmError::Parse("已取消".into())),
     };
     let outcome = match outcome {
       Ok(o) => o,
       Err(e) => {
+        if cancel.is_cancelled() {
+          finish(&registry);
+          return Err(CANCELLED_MSG.into());
+        }
         // 部分兼容 API 不支持 tools：检测到相关报错时降级为纯文本对话重试
         if tools_enabled {
           let lower = e.to_string().to_lowercase();
@@ -2846,6 +2978,7 @@ pub async fn chatbot_chat(
             }
           }
         }
+        finish(&registry);
         return Err(e.to_string());
       }
     };
@@ -2868,6 +3001,7 @@ pub async fn chatbot_chat(
       .filter(|c| !c.is_empty())
       .filter(|_| tools_enabled)
     else {
+      finish(&registry);
       return Ok(ChatReplyDto {
         content: outcome.content,
         model: outcome.model,
@@ -2877,7 +3011,18 @@ pub async fn chatbot_chat(
 
     if rounds >= CHATBOT_MAX_ROUNDS {
       // 轮次上限：不带工具强制模型给出最终回答
-      let final_outcome = agent::chat(&config, &msgs).await.map_err(|e| e.to_string())?;
+      let final_call = agent::chat_with_tools_timeout(&config, &msgs, None, CHATBOT_LLM_TIMEOUT);
+      let final_outcome = tokio::select! {
+        r = final_call => r,
+        _ = cancel.wait_cancelled() => Err(agent::LlmError::Parse("已取消".into())),
+      };
+      let final_outcome = match final_outcome {
+        Ok(o) => o,
+        Err(_) => {
+          finish(&registry);
+          return Err(CANCELLED_MSG.into());
+        }
+      };
       {
         let conn = state.lock().map_err(|e| e.to_string())?;
         let _ = db::record_llm_usage(
@@ -2888,6 +3033,7 @@ pub async fn chatbot_chat(
           final_outcome.usage.total_tokens,
         );
       }
+      finish(&registry);
       return Ok(ChatReplyDto {
         content: final_outcome.content,
         model: final_outcome.model,
@@ -2904,7 +3050,7 @@ pub async fn chatbot_chat(
       tool_call_id: None,
     });
 
-    // 逐个执行工具并回填结果（轨迹收集至 steps，供前端展示）
+    // 逐个执行工具并回填结果（轨迹收集至 steps，供前端展示；实时推送）
     {
       let conn = state.lock().map_err(|e| e.to_string())?;
       for call in &calls {
@@ -2938,6 +3084,8 @@ pub async fn chatbot_chat(
           tool_calls: None,
           tool_call_id: Some(call_id),
         });
+        // 实时推送当前工具轨迹（打断检查放在每轮 LLM 调用前）
+        progress(&steps);
       }
     }
   }

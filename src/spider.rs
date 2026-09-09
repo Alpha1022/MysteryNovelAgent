@@ -498,19 +498,40 @@ pub fn douban_comments_url(book_url: &str) -> String {
   format!("{base}/comments/")
 }
 
-/// 解析豆瓣书籍页 HTML，提取简介（第一个 `div.intro` 内段落拼接）
+/// 解析豆瓣书籍页 HTML，提取内容简介（段落以换行拼接）
 ///
-/// 对应豆瓣书籍页: <div id="intro"><div class="intro"><p>…</p>…</div></div>
-/// 兜底: <meta property="og:description" content="…">
+/// 对应豆瓣书籍页内容简介区（`div.related_info` 内首个 `div.indent#link-report`）：
+/// - 短简介：`<div class="indent" id="link-report"><div class="intro"><p>…</p></div></div>`
+/// - 长简介（会被截短）：
+///   `<span class="short"><div class="intro">…截短…(展开全部)</div></span>`
+///   `<span class="all hidden"><div class="intro">…完整…</div></span>`
+///   → 优先取 `span.all` 内的完整版（作者简介等后续区块也是同款结构，
+///     因此必须限定在 `#link-report` 区内查找，不能全文档取第一个）。
+/// 兜底: 全文档第一个 `div.intro`（页面改版丢 #link-report 时）→ og:description meta
 pub fn parse_douban_description(html: &str) -> Option<String> {
   let document = Html::parse_document(html);
+
+  // 内容简介区：`<div class="indent" id="link-report">`（书籍页内容简介容器）
+  let sel_report = Selector::parse(r#"div#link-report"#).ok()?;
   let sel_intro = Selector::parse("div.intro").ok()?;
-  if let Some(intro) = document.select(&sel_intro).next() {
+  // 长简介完整版：`#link-report` 内 `<span class="all hidden"><div class="intro">…</div></span>`
+  let sel_all = Selector::parse("span.all div.intro").ok()?;
+
+  let scope = document.select(&sel_report).next();
+  let intro = scope
+    .and_then(|s| s.select(&sel_all).next())
+    // 短简介 / 无 span.all 结构：取区内第一个 div.intro（长简介截短版也在此，仅兜底）
+    .or_else(|| scope.and_then(|s| s.select(&sel_intro).next()))
+    // 页面结构漂移：回退全文档第一个 div.intro
+    .or_else(|| document.select(&sel_intro).next());
+
+  if let Some(intro) = intro {
     let sel_p = Selector::parse("p").ok()?;
     let text = intro
       .select(&sel_p)
       .map(|p| normalize_ws(&p.text().collect::<String>()))
-      .filter(|t| !t.is_empty())
+      // 展开链接段落（“(展开全部)”）在结构漂移兜底路径下可能混入，防御性剔除
+      .filter(|t| !t.is_empty() && t != "(展开全部)")
       .collect::<Vec<_>>()
       .join("\n");
     let text = text.trim().to_string();
@@ -756,6 +777,68 @@ mod tests {
     );
 
     assert!(parse_douban_description("<html><body></body></html>").is_none());
+  }
+
+  /// 豆瓣长简介解析：#link-report 内 span.short（截短）+ span.all hidden（完整），
+  /// 必须取完整版；且不能串到作者简介区（同款 short/all 结构）
+  #[test]
+  fn test_parse_douban_description_long() {
+    // 结构来源：https://book.douban.com/subject/30354903/
+    // 内容简介长文被豆瓣截短，完整版在 span.all hidden 内；作者简介区有同款结构
+    let html = r#"<html><body>
+      <div class="related_info">
+        <h2><span>内容简介</span></h2>
+        <div class="indent" id="link-report">
+          <span class="short">
+            <div class="intro">
+              <p>第一条营销文案。</p>
+              <p>第二条营销文案被截短...</p>
+              <p><a href="javascript:void(0)" class="j a_show_full">(展开全部)</a></p>
+            </div>
+          </span>
+          <span class="all hidden">
+            <div class="intro">
+              <p>第一条营销文案。</p>
+              <p>第二条营销文案的完整内容。</p>
+              <p>内容简介正文段落。</p>
+            </div>
+          </span>
+        </div>
+        <h2><span>作者简介</span></h2>
+        <div class="indent">
+          <span class="short"><div class="intro"><p>作者简介截短版。</p></div></span>
+          <span class="all hidden"><div class="intro"><p>作者简介完整版，绝不能被当成内容简介。</p></div></span>
+        </div>
+      </div>
+    </body></html>"#;
+    assert_eq!(
+      parse_douban_description(html).as_deref(),
+      Some("第一条营销文案。\n第二条营销文案的完整内容。\n内容简介正文段落。")
+    );
+  }
+
+  /// 豆瓣短简介解析：#link-report 内直接是 div.intro（无 short/all 结构），
+  /// 同样不得串到作者简介区
+  #[test]
+  fn test_parse_douban_description_short() {
+    // 结构来源：https://book.douban.com/subject/26771719/
+    let html = r#"<html><body>
+      <div class="related_info">
+        <h2><span>内容简介</span></h2>
+        <div class="indent" id="link-report">
+          <div class="intro"><p>钟表馆的完整内容简介，篇幅不长未被截短。</p></div>
+        </div>
+        <h2><span>作者简介</span></h2>
+        <div class="indent">
+          <span class="short"><div class="intro"><p>作者简介截短版。</p></div></span>
+          <span class="all hidden"><div class="intro"><p>作者简介完整版，绝不能被当成内容简介。</p></div></span>
+        </div>
+      </div>
+    </body></html>"#;
+    assert_eq!(
+      parse_douban_description(html).as_deref(),
+      Some("钟表馆的完整内容简介，篇幅不长未被截短。")
+    );
   }
 
   /// searchMode=fuzzy 反序列化

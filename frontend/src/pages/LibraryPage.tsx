@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   analyzeEpub,
   cancelSyncTask,
@@ -11,6 +10,8 @@ import {
   importEpub,
   llmStatus,
   mergeBooks,
+  openStoragePermissionSettings,
+  saveDroppedFile,
   setBookStatus,
   webdavPull,
   webdavPush,
@@ -59,6 +60,8 @@ type CoverSize = "large" | "medium" | "small";
 
 const VIEW_KEY = "library.view";
 const SIZE_KEY = "library.coverSize";
+/** 书架滚动位置（localStorage：跨会话保持，返回页面或重启应用后恢复） */
+const SCROLL_KEY = "library.scrollY";
 
 function loadView(): ViewMode {
   const v = localStorage.getItem(VIEW_KEY);
@@ -219,6 +222,8 @@ export default function LibraryPage() {
   /** 同步实时进度（task-progress 事件中 phase 以 webdav- 开头的负载） */
   const [syncPhase, setSyncPhase] = useState<TaskProgressEvent | null>(null);
   const syncTaskIdRef = useRef<string>("");
+  /** 书库目录不可写（Android 存储权限缺失）→ 显示授权引导 */
+  const [permPrompt, setPermPrompt] = useState(false);
   const [query, setQuery] = useState("");
   const [debounced, setDebounced] = useState("");
 
@@ -353,6 +358,84 @@ export default function LibraryPage() {
     return () => clearTimeout(t);
   }, [query]);
 
+  // 书架滚动位置持久化：滚动防抖保存 + 离开页面/关闭时立即保存。
+  // 三个坑都以 ref + 已滚动标记兜底，不直接信任 window.scrollY：
+  // 1. 卸载时 DOM 已被路由替换、文档高度骤降会把 scrollY 钳制成 0；
+  // 2. 返回书架瞬间文档短暂变矮，浏览器派发的钳制滚动事件（scrollY=0）
+  //    会被刚挂载的监听记录 —— 恢复流程完成前忽略一切滚动事件；
+  // 3. StrictMode（开发模式）挂载后会立即执行一次清理，全新 ref 的值
+  //    （0）会把已存位置清掉 —— 只有记录过真实滚动才允许写入。
+  const scrollYRef = useRef(0);
+  const scrollReadyRef = useRef(false);
+  const hasScrolledRef = useRef(false);
+  useEffect(() => {
+    const save = () => {
+      if (hasScrolledRef.current) {
+        localStorage.setItem(SCROLL_KEY, String(scrollYRef.current));
+      }
+    };
+    let t: number | undefined;
+    const onScroll = () => {
+      if (!scrollReadyRef.current) return;
+      hasScrolledRef.current = true;
+      scrollYRef.current = window.scrollY;
+      if (t !== undefined) return;
+      t = window.setTimeout(() => {
+        t = undefined;
+        save();
+      }, 200);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("pagehide", save);
+    return () => {
+      save();
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("pagehide", save);
+      if (t !== undefined) clearTimeout(t);
+    };
+  }, []);
+
+  // 书籍加载完成后恢复上次滚动位置（每次挂载仅恢复一次；内容高度不足时
+  // 滚动会被浏览器钳制 —— 封面等资源是延迟加载的，短暂重试直至到位；
+  // 用户主动滚动/按键立即停止重试，避免抢夺滚动权）
+  const scrollRestoredRef = useRef(false);
+  useEffect(() => {
+    if (loading || scrollRestoredRef.current) return;
+    scrollRestoredRef.current = true;
+    // 页面就绪：此后才信任滚动事件（见上 scrollReadyRef 注释）
+    scrollReadyRef.current = true;
+    const saved = Number(localStorage.getItem(SCROLL_KEY) ?? "0");
+    if (!(saved > 0)) return;
+
+    let reached = false;
+    let stopped = false;
+    let timer: number | undefined;
+    const stop = () => {
+      stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+      window.removeEventListener("wheel", stop);
+      window.removeEventListener("touchstart", stop);
+      window.removeEventListener("keydown", stop);
+    };
+    let tries = 0;
+    const attempt = () => {
+      if (stopped || reached) return;
+      window.scrollTo({ top: saved });
+      if (Math.abs(window.scrollY - saved) <= 2 || ++tries >= 25) {
+        reached = true;
+        stop();
+        return;
+      }
+      timer = window.setTimeout(attempt, 120);
+    };
+    window.addEventListener("wheel", stop, { passive: true });
+    window.addEventListener("touchstart", stop, { passive: true });
+    window.addEventListener("keydown", stop);
+    requestAnimationFrame(attempt);
+    return stop;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading]);
+
   useEffect(() => {
     llmStatus()
       .then((s) => setLlmReady(s.configured))
@@ -362,7 +445,8 @@ export default function LibraryPage() {
   // 订阅后端长任务进度事件（导入类 → phase；WebDav 同步类 → syncPhase）
   useEffect(() => {
     const un = listen<TaskProgressEvent>("task-progress", (e) => {
-      if (e.payload.phase.startsWith("webdav")) setSyncPhase(e.payload);
+      // 空值保护：单个畸形事件不应杀死整个监听器（否则导入进度也会静默丢失）
+      if (e.payload?.phase?.startsWith("webdav")) setSyncPhase(e.payload);
       else setPhase(e.payload);
     });
     return () => {
@@ -441,12 +525,20 @@ export default function LibraryPage() {
           ? `；数据库：入库 ${r.books_imported}，覆盖 ${r.books_updated}，移除 ${r.books_deleted}`
           : "";
       const failPart = r.failed > 0 ? `，失败 ${r.failed}` : "";
-      setNotice(base + dbPart + failPart);
+      // 错误明细只展示首条（完整明细见日志 adb logcat -s tauri / 控制台）
+      const errPart =
+        r.errors.length > 0
+          ? `；${r.errors[0]}${r.errors.length > 1 ? `（等 ${r.errors.length} 条错误，详见日志）` : ""}`
+          : "";
+      setNotice(base + dbPart + failPart + errPart);
       // 数据/文件有变动时刷新书架
       if (r.books_imported + r.books_deleted > 0 || dir === "pull") setRefresh((k) => k + 1);
     } catch (e) {
-      if (!isCancelledErr(e)) setError(String(e));
-      else setNotice("同步已打断");
+      if (!isCancelledErr(e)) {
+        setError(String(e));
+        // 可写性预检失败（Android 公共存储未授权）→ 提供一键跳转授权页
+        if (String(e).includes("书库目录不可写")) setPermPrompt(true);
+      } else setNotice("同步已打断");
     } finally {
       setSyncBusy(false);
       setSyncDir(null);
@@ -457,6 +549,15 @@ export default function LibraryPage() {
   /** 打断进行中的 WebDav 同步 */
   const onSyncCancel = () => {
     if (syncTaskIdRef.current) void cancelSyncTask(syncTaskIdRef.current);
+  };
+
+  /** 跳转系统「所有文件访问」授权页（移动端；桌面为空操作） */
+  const onGrantStorage = async () => {
+    try {
+      await openStoragePermissionSettings();
+    } finally {
+      setPermPrompt(false);
+    }
   };
 
   /** 加书：选择单个 EPUB → 分析元数据 → 确认弹窗 */
@@ -532,10 +633,10 @@ export default function LibraryPage() {
       }
 
       if (autoImport && pv.matched) {
-        // 唯一匹配直连导入（快速路径）
+        // 唯一匹配直连导入（快速路径）；书名/作者优先采用爬取到的
         const params = {
-          title: pv.title,
-          author: pv.author,
+          title: pv.matched.title.trim() || pv.title,
+          author: pv.matched.author.trim() || pv.author,
           tags: ensureMysteryTag(pv.matched.tags, defaultTags),
         };
         const taskId = nextTaskId();
@@ -600,19 +701,10 @@ export default function LibraryPage() {
     }
   };
 
-  /** 拖拽导入：EPUB 文件走单本/批量流程，文件夹递归收集 */
+  /** 拖拽导入：EPUB 文件走单本/批量流程（文件夹已在 HTML5 层展开） */
   const handleDrop = async (paths: string[]) => {
     if (addBusy) return;
-    const epubs: string[] = [];
-    for (const p of paths) {
-      if (p.toLowerCase().endsWith(".epub")) {
-        epubs.push(p);
-      } else {
-        // 非文件夹（普通文件）会收集失败，静默忽略
-        const inner = await collectEpubs(p).catch(() => [] as string[]);
-        epubs.push(...inner);
-      }
-    }
+    const epubs = paths.filter((p) => p.toLowerCase().endsWith(".epub"));
     if (epubs.length === 0) {
       setNotice("拖拽内容中没有 EPUB 文件或文件夹");
       return;
@@ -635,23 +727,142 @@ export default function LibraryPage() {
     await runBatch(epubs);
   };
 
-  // 订阅 WebView 拖拽事件
-  useEffect(() => {
-    const un = getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === "enter" || event.payload.type === "over") {
-        setDragging(true);
-      } else if (event.payload.type === "leave") {
-        setDragging(false);
-      } else if (event.payload.type === "drop") {
-        setDragging(false);
-        void handleDrop(event.payload.paths);
-      }
-    });
-    return () => {
-      un.then((fn) => fn()).catch(() => undefined);
+  // 拖拽处理函数经 ref 引用：事件监听只注册一次，避免闭包捕获过期状态
+  const handleDropRef = useRef(handleDrop);
+  handleDropRef.current = handleDrop;
+
+  // ============================= //
+  //  HTML5 拖拽导入（唯一通道）
+  // ============================= //
+  // WebView2（Chromium）自行处理 OLE 拖拽并把外部文件转成标准 DragEvent，
+  // wry 的原生 tauri://drag-* 通道在窗口化托管下实际收不到事件
+  // （拖拽被 WebView2 内部输入窗口接管，wry 注册的 OLE 目标不会触发），
+  // 因此 tauri.conf.json 关闭 dragDropEnabled 保持 WebView2 默认放行外部拖拽。
+  // 页面侧拿不到本地路径（浏览器安全限制，只有 File 内容）→ 读出字节经
+  // IPC 落临时文件取回路径，再复用既有的单本/批量导入流程。
+  // 文件夹拖入经 webkitGetAsEntry 递归展开（entries 必须在事件回调内同步取出）。
+
+  /** 递归展开 DataTransfer 里的文件与目录，返回 EPUB 文件列表 */
+  const collectDroppedEpubs = async (dt: DataTransfer): Promise<File[]> => {
+    const epubs: File[] = [];
+    const pushFile = (f: File) => {
+      if (f.name.toLowerCase().endsWith(".epub")) epubs.push(f);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoImport, batchStatus != null]);
+    // webkitGetAsEntry 必须同步调用（事件返回后 entries 失效）
+    const entries: FileSystemEntry[] = Array.from(dt.items ?? [])
+      .filter((it) => it.kind === "file")
+      .map((it) => it.webkitGetAsEntry())
+      .filter((e): e is FileSystemEntry => !!e);
+
+    if (entries.length === 0) {
+      // 兜底：无 entries API（或非文件源）时直接取 files
+      for (const f of Array.from(dt.files ?? [])) pushFile(f);
+      return epubs;
+    }
+
+    const readEntries = (reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> =>
+      new Promise((resolve) => {
+        // readEntries 每次最多返回 100 条，循环读到空为止
+        const all: FileSystemEntry[] = [];
+        const next = (batch: FileSystemEntry[]) => {
+          if (batch.length === 0) {
+            resolve(all);
+            return;
+          }
+          all.push(...batch);
+          reader.readEntries(next, () => resolve(all));
+        };
+        reader.readEntries(next, () => resolve(all));
+      });
+
+    const walk = async (entry: FileSystemEntry): Promise<void> => {
+      if (entry.isFile) {
+        const file = await new Promise<File | null>((resolve) =>
+          (entry as FileSystemFileEntry).file(resolve, () => resolve(null)),
+        );
+        if (file) pushFile(file);
+      } else if (entry.isDirectory) {
+        const children = await readEntries((entry as FileSystemDirectoryEntry).createReader());
+        for (const child of children) await walk(child);
+      }
+    };
+    for (const entry of entries) await walk(entry);
+    return epubs;
+  };
+
+  /** HTML5 drop：读字节落临时文件 → 复用路径式导入流程 */
+  const handleHtml5Drop = async (dt: DataTransfer) => {
+    if (addBusy) return;
+    const files = await collectDroppedEpubs(dt);
+    if (files.length === 0) {
+      setNotice("拖拽内容中没有 EPUB 文件或文件夹");
+      return;
+    }
+    setNotice(null);
+    setWarnNotice(null);
+    setError(null);
+    batchCancelRef.current = false;
+    setBatchStatus(`读取拖入的 ${files.length} 个文件…`);
+    const paths: string[] = [];
+    try {
+      for (const f of files) {
+        // 用户打断：停止读取剩余文件
+        if (batchCancelRef.current) break;
+        setBatchStatus(`读取拖入文件（${paths.length + 1}/${files.length}）：${f.name}`);
+        try {
+          const bytes = new Uint8Array(await f.arrayBuffer());
+          paths.push(await saveDroppedFile(f.name, bytes));
+        } catch (e) {
+          setError(`读取拖入文件失败：${f.name} — ${String(e)}`);
+        }
+      }
+    } finally {
+      setBatchStatus(null);
+    }
+    if (paths.length === 0) return;
+    await handleDropRef.current(paths);
+  };
+
+  // HTML5 拖拽事件（仅注册一次；经 ref 调用最新处理函数）
+  const html5DropRef = useRef(handleHtml5Drop);
+  html5DropRef.current = handleHtml5Drop;
+
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+    const onEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth += 1;
+      setDragging(true);
+    };
+    const onLeave = () => {
+      // dragenter/dragleave 在子元素间穿梭会成对触发，计数归零才算真正离开
+      if (depth === 0) return;
+      depth -= 1;
+      if (depth === 0) setDragging(false);
+    };
+    const onOver = (e: DragEvent) => {
+      // 必须 preventDefault，否则窗口不显示可放置状态且 drop 不触发
+      if (hasFiles(e)) e.preventDefault();
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setDragging(false);
+      void html5DropRef.current(e.dataTransfer ?? new DataTransfer());
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("dragover", onOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("dragover", onOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
 
   /** 打断批量导入：停止后续书籍 + 打断当前导入任务 */
   const onBatchCancel = () => {
@@ -1071,6 +1282,22 @@ export default function LibraryPage() {
         </div>
       )}
 
+      {permPrompt && (
+        <div className="notice warn batch-bar">
+          <div className="batch-info">
+            <div className="batch-text">
+              书库目录不可写：请在系统设置中授予「所有文件访问」权限后重试同步。
+              （也可以改用应用私有目录作为书库目录，无需任何权限）
+            </div>
+          </div>
+          <button className="btn small primary" onClick={() => void onGrantStorage()}>
+            去授权
+          </button>
+          <button className="btn small" onClick={() => setPermPrompt(false)}>
+            知道了
+          </button>
+        </div>
+      )}
       {syncBusy && syncDir && (
         <div className="notice running batch-bar">
           <div className="batch-info">

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { chatbotChat } from "../api/tauri";
+import { cancelTask, chatbotChat } from "../api/tauri";
 import { readTextFile, writeTextFile } from "../api/picker";
 import { renderMarkdown } from "../utils/markdown";
-import type { ChatMessage, ChatSession } from "../types";
+import type { ChatMessage, ChatSession, ChatStep } from "../types";
 
 /**
  * 书虫 · 阅读助手：右下角悬浮入口。
@@ -45,29 +46,34 @@ function newSession(): ChatSession {
   };
 }
 
+/** 工具调用轨迹列表（消息气泡与生成中的实时展示共用） */
+function StepsList({ steps }: { steps: ChatStep[] }) {
+  return (
+    <div className="chat-steps">
+      {steps.map((s, i) => (
+        <details key={i} className="chat-step" open={i === steps.length - 1}>
+          <summary>
+            <span className="chat-step-tool">🔧 {s.tool}</span>
+          </summary>
+          <div className="chat-step-body">
+            <div className="chat-step-label">实参</div>
+            <pre>{s.args}</pre>
+            <div className="chat-step-label">结果</div>
+            <pre>{s.result}</pre>
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 /** 单条消息气泡（assistant 附带工具轨迹 + Markdown 渲染） */
 function MessageBubble({ m }: { m: ChatMessage }) {
   const steps = m.role === "assistant" ? (m.steps ?? []) : [];
   return (
     <div className={`chat-msg ${m.role}`}>
       <div className="chat-bubble">
-        {steps.length > 0 && (
-          <div className="chat-steps">
-            {steps.map((s, i) => (
-              <details key={i} className="chat-step">
-                <summary>
-                  <span className="chat-step-tool">🔧 {s.tool}</span>
-                </summary>
-                <div className="chat-step-body">
-                  <div className="chat-step-label">实参</div>
-                  <pre>{s.args}</pre>
-                  <div className="chat-step-label">结果</div>
-                  <pre>{s.result}</pre>
-                </div>
-              </details>
-            ))}
-          </div>
-        )}
+        {steps.length > 0 && <StepsList steps={steps} />}
         <div
           className="chat-md"
           dangerouslySetInnerHTML={{
@@ -90,7 +96,20 @@ export default function Chatbot() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 生成中的实时工具调用轨迹（chat-progress 事件推送） */
+  const [liveSteps, setLiveSteps] = useState<ChatStep[]>([]);
   const listRef = useRef<HTMLDivElement>(null);
+  const chatTaskIdRef = useRef<string>("");
+
+  // 订阅书虫 agent 的实时工具轨迹
+  useEffect(() => {
+    const un = listen<{ steps: ChatStep[] }>("chat-progress", (e) => {
+      setLiveSteps(e.payload.steps ?? []);
+    });
+    return () => {
+      un.then((fn) => fn()).catch(() => undefined);
+    };
+  }, []);
 
   // 当前会话（无则懒创建）
   const current =
@@ -109,10 +128,10 @@ export default function Chatbot() {
     if (current) localStorage.setItem(CURRENT_KEY, current.id);
   }, [current?.id]);
 
-  // 新消息自动滚动到底部
+  // 新消息自动滚动到底部（生成中的实时工具轨迹到达时同样滚动）
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
-  }, [current?.messages, busy, showHistory]);
+  }, [current?.messages, busy, showHistory, liveSteps.length]);
 
   const send = async () => {
     const text = input.trim();
@@ -144,11 +163,14 @@ export default function Chatbot() {
     setBusy(true);
     setError(null);
     setNotice(null);
+    setLiveSteps([]);
+    const taskId = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    chatTaskIdRef.current = taskId;
     try {
       const history = next.filter(
         (m) => m.role === "user" || m.role === "assistant",
       );
-      const res = await chatbotChat(history);
+      const res = await chatbotChat(history, taskId);
       mutateSession(sid, (s) => ({
         ...s,
         messages: [
@@ -162,10 +184,21 @@ export default function Chatbot() {
         savedAt: Date.now(),
       }));
     } catch (e) {
-      setError(String(e));
+      // 打断不算错误：给出友好提示
+      if (String(e).includes("已取消") || String(e).includes("任务已取消")) {
+        setNotice("已打断本次思考");
+      } else {
+        setError(String(e));
+      }
     } finally {
+      setLiveSteps([]);
       setBusy(false);
     }
+  };
+
+  /** 打断书虫的思考过程（中止进行中的 LLM 请求与后续工具调用） */
+  const onChatCancel = () => {
+    if (chatTaskIdRef.current) void cancelTask(chatTaskIdRef.current);
   };
 
   const onCreate = () => {
@@ -328,10 +361,22 @@ export default function Chatbot() {
             ))}
             {busy && (
               <div className="chat-msg assistant">
-                <div className="chat-bubble typing">
-                  <span />
-                  <span />
-                  <span />
+                <div className="chat-bubble">
+                  {liveSteps.length > 0 && <StepsList steps={liveSteps} />}
+                  <div className="chat-thinking-row">
+                    <span className="chat-thinking-dots">
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                    <button
+                      className="chat-cancel"
+                      onClick={onChatCancel}
+                      title="打断思考过程（中止进行中的请求与工具调用）"
+                    >
+                      打断
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
