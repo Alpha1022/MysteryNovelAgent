@@ -4,7 +4,9 @@ frontend/dist/
 *.db
 release/
 
-src-tauri/gen/
+# Tauri 移动端工程：gen/android（含 Manifest 权限与 Kotlin 插件）随仓库分发；
+# 仅忽略可再生的 schemas（gen/android 内部的构建产物由其自带 .gitignore 排除）
+src-tauri/gen/schemas/
 
 # 个人 AI 开发工具配置（不随仓库分发）
 opencode.json

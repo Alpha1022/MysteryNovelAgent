@@ -486,8 +486,11 @@ model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 仓库 remote 为 GitLab（git.tsinghua.edu.cn），CI 走 GitLab（GitHub Actions 不会在此 remote 运行）：
 
 - **触发**：默认分支每次 push / 手动触发 → 滚动构建；推 `v*` 标签 → 正式 Release。
-- **build:linux-cli**：Linux runner 原生构建 CLI（`cargo build --release -p mystery-novel-agent`）。
-- **build:windows**：Linux 上经 **cargo-xwin 交叉编译**（tauri 官方跨平台方案 `cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`，需 clang/llvm + nsis + node）→ NSIS 安装包 + Windows CLI exe；产物统一 ASCII 命名。
-- **publish:continuous**：产物上传 generic package registry 的 `continuous` 版本（同名覆盖、永远最新，入口 Deploy → Package Registry）。
-- **publish:release**：标签时上传版本化产物并以 `release-cli` 创建 Release（assets 指向 package registry 链接）。
-- 缓存只含 cargo registry / xwin SDK 缓存 / npm（target 数 GB 不缓存，全量编译约 20–40 分钟）。
+- **自动构建**（Linux Docker runner，产物进 continuous 包与 Release）：
+  - `build:linux-cli`：Linux 原生构建 CLI；
+  - `build:windows`：**cargo-xwin 交叉编译**（tauri 官方跨平台方案 `cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`，需 clang/llvm + nsis + node）→ NSIS 安装包 + Windows CLI；
+  - `build:android`：Android APK（`cargo tauri android build --apk --target aarch64 --target armv7`，JDK 17 + cmdline-tools 安装 SDK 36/NDK 26，gradle wrapper 自举）。**签名经环境变量**（gen/android 的 build.gradle.kts 读取 `KEYSTORE_FILE/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD`）：默认每次构建临时生成密钥（覆盖安装需先卸载），在 CI 变量配置 `ANDROID_KEYSTORE_B64` 等四项则用稳定密钥。
+- **手动 job**（`tags: [macos]` + `when: manual` + `allow_failure`——课程 GitLab 大概率无 macOS runner，不点击不影响流水线）：`build:macos` 出 DMG 并自行上传包仓库（标签流水线上运行时经 Release 链接 API 追加资产）；`build:ios` 为**未签名模拟器构建**（`cargo tauri ios init --ci` 现场生成 gen/apple + `xcodebuild -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO`，仅验证可编译，真机安装需开发者证书重签）。
+- `publish:continuous` / `publish:release`：三个自动构建的产物上传 generic package registry（continuous 同名覆盖 / 标签版本化 + release-cli 建 Release）；产物统一 ASCII 命名（原 NSIS 安装包名含中文）。
+- **gen/android 随仓库分发**（Tauri 官方推荐）：Manifest 存储权限、Kotlin 插件（StoragePermissionPlugin）、签名配置都在其中；每次构建再生的文件（`tauri.settings.gradle` 含 cargo registry 绝对路径、`jniLibs/*.so`、generated/）由其自带 .gitignore 排除；`gradlew` 在 git index 中标记 755（Windows 提交默认丢执行位，Linux 上 gradle wrapper 会跑不起来）。根 .gitignore 只忽略 `gen/schemas/`。
+- 缓存：cargo registry / xwin SDK / Android SDK / gradle / npm（target 数 GB 不缓存，全量编译每 job 约 20–40 分钟）。
