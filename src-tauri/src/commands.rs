@@ -1731,6 +1731,26 @@ async fn store_cover(
   Ok(CoverUpdateDto { cover_path: new_cover })
 }
 
+/// 读取本地图片字节（封面上传的裁剪预览用；路径来自系统文件对话框，
+/// 与 upload_cover 同级信任；扩展名校验同 COVER_EXTS）
+#[tauri::command]
+pub fn read_image_file(path: String) -> Result<tauri::ipc::Response, String> {
+  let p = PathBuf::from(path.trim());
+  if !p.is_file() {
+    return Err("图片文件不存在".into());
+  }
+  let ext = p
+    .extension()
+    .and_then(|e| e.to_str())
+    .map(|e| e.to_lowercase())
+    .unwrap_or_default();
+  if !COVER_EXTS.contains(&ext.as_str()) {
+    return Err(format!("不支持的图片格式 .{ext}（仅支持 jpg/png/webp）"));
+  }
+  let bytes = std::fs::read(&p).map_err(|e| format!("图片读取失败: {e}"))?;
+  Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// 手动上传封面：读取图片字节 → 共用落盘/同步链（EPUB 副本嵌入 + 数据库更新）
 #[tauri::command]
 pub async fn upload_cover(

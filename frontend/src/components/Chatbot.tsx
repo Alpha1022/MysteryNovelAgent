@@ -685,7 +685,11 @@ export default function Chatbot() {
               }
             })();
           }}
-          onClose={() => setMetaEditBook(null)}
+          onClose={(changed) => {
+            setMetaEditBook(null);
+            // changed=true：封面已上传更新，刷新书架
+            if (changed) notifyLibraryRefresh();
+          }}
         />
       )}
       {reviewTarget && (

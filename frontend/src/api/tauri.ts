@@ -273,6 +273,11 @@ export function openBookFile(id: number): Promise<void> {
 }
 
 /** 手动上传封面替换，返回新的封面路径 */
+/** 读取本地图片字节（封面上传的裁剪预览用；路径来自系统文件对话框） */
+export function readImageFile(path: string): Promise<ArrayBuffer> {
+  return invoke("read_image_file", { path });
+}
+
 export function uploadCover(
   bookId: number,
   imagePath: string,

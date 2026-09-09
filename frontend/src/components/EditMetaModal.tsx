@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { translateText, uploadCover } from "../api/tauri";
+import { readImageFile, saveDroppedFile, translateText, uploadCover } from "../api/tauri";
 import type { BookDetail } from "../types";
 import CoverImage from "./CoverImage";
+import CoverCrop from "./CoverCrop";
 
 export interface MetaEditParams {
   title: string;
@@ -20,7 +21,8 @@ interface Props {
   /** LLM 可用性（翻译按钮显示条件） */
   llmReady?: boolean | null;
   onSave: (params: MetaEditParams) => void;
-  onClose: () => void;
+  /** changed=true 表示封面已更新（调用方需刷新书籍数据） */
+  onClose: (changed?: boolean) => void;
 }
 
 /** 详情页元数据编辑弹窗：封面 / 书名 / 作者 / 标签 / 简介（各字段可翻译为中文） */
@@ -43,8 +45,39 @@ export default function EditMetaModal({
   const [coverBusy, setCoverBusy] = useState(false);
   const [translating, setTranslating] = useState<string | null>(null);
   const [transError, setTransError] = useState<string | null>(null);
+  /** 截取模式：已选原图（objectURL + 原始字节），等待用户截取/直接上传 */
+  const [cropSrc, setCropSrc] = useState<{
+    url: string;
+    isPng: boolean;
+    bytes: ArrayBuffer;
+  } | null>(null);
 
-  /** 手动上传封面（复制入封面缓存 + 同步 EPUB 副本 + 更新数据库） */
+  // 截取图更换/卸载时回收 objectURL
+  useEffect(() => {
+    return () => {
+      if (cropSrc) URL.revokeObjectURL(cropSrc.url);
+    };
+  }, [cropSrc]);
+
+  /** 把图片字节落临时文件后走既有上传链（缓存去重 + EPUB 同步 + DB 更新） */
+  const applyCoverBytes = async (bytes: ArrayBuffer | Blob, ext: "png" | "jpg") => {
+    setCoverBusy(true);
+    setTransError(null);
+    try {
+      const buf = bytes instanceof Blob ? await bytes.arrayBuffer() : bytes;
+      const tmp = await saveDroppedFile(`cover.${ext}`, new Uint8Array(buf));
+      await uploadCover(book.id, tmp);
+      // 封面已更新：通知调用方刷新（DB 的 cover_path 已换新文件）
+      onClose(true);
+    } catch (e) {
+      setTransError(String(e));
+    } finally {
+      setCoverBusy(false);
+    }
+  };
+
+  /** 手动上传封面（复制入封面缓存 + 同步 EPUB 副本 + 更新数据库）：
+   *  选择后进入截取模式（可跳过），按 2:3 展示比例截取后上传 */
   const onUploadCover = async () => {
     setTransError(null);
     const path = await open({
@@ -55,9 +88,10 @@ export default function EditMetaModal({
     if (typeof path !== "string") return;
     setCoverBusy(true);
     try {
-      await uploadCover(book.id, path);
-      // 封面已更新，关闭弹窗让详情页刷新
-      onClose();
+      const buf = await readImageFile(path);
+      const isPng = /\.png$/i.test(path);
+      const blob = new Blob([buf], { type: isPng ? "image/png" : "image/jpeg" });
+      setCropSrc({ url: URL.createObjectURL(blob), isPng, bytes: buf });
     } catch (e) {
       setTransError(String(e));
     } finally {
@@ -103,8 +137,22 @@ export default function EditMetaModal({
   return (
     <div className="modal-overlay">
       <div className="modal mid">
-        <h2 className="modal-title">编 辑 元 数 据</h2>
+        <h2 className="modal-title">{cropSrc ? "截 取 封 面" : "编 辑 元 数 据"}</h2>
 
+        {cropSrc ? (
+          <CoverCrop
+            src={cropSrc.url}
+            isPng={cropSrc.isPng}
+            busy={busy || coverBusy}
+            onCancel={() => setCropSrc(null)}
+            onUseOriginal={() => {
+              void applyCoverBytes(cropSrc.bytes, cropSrc.isPng ? "png" : "jpg");
+            }}
+            onConfirm={(blob) => {
+              void applyCoverBytes(blob, cropSrc.isPng ? "png" : "jpg");
+            }}
+          />
+        ) : (
         <div className="edit-layout">
           <div className="edit-side">
             <div className="edit-side-cover">
@@ -115,7 +163,7 @@ export default function EditMetaModal({
               onClick={onUploadCover}
               disabled={busy || coverBusy}
             >
-              {coverBusy ? "上传中…" : "上传封面…"}
+              {coverBusy ? "处理中…" : "上传封面…"}
             </button>
           </div>
 
@@ -191,32 +239,35 @@ export default function EditMetaModal({
             </div>
           </div>
         </div>
+        )}
 
         {(error || transError) && (
           <div className="modal-error">{transError ?? error}</div>
         )}
 
-        <div className="modal-actions">
-          <button className="btn" onClick={onClose} disabled={busy}>
-            取消
-          </button>
-          <button
-            className="btn primary"
-            disabled={busy || !title.trim()}
-            onClick={() =>
-              onSave({
-                title,
-                author,
-                tags: tagsStr,
-                description: desc.trim() ? desc : null,
-                seriesName: seriesName.trim() ? seriesName : null,
-                seriesOrder: seriesName.trim() && seriesOrder.trim() ? Number(seriesOrder) : null,
-              })
-            }
-          >
-            {busy ? "保存中…" : "保 存"}
-          </button>
-        </div>
+        {!cropSrc && (
+          <div className="modal-actions">
+            <button className="btn" onClick={() => onClose()} disabled={busy}>
+              取消
+            </button>
+            <button
+              className="btn primary"
+              disabled={busy || !title.trim()}
+              onClick={() =>
+                onSave({
+                  title,
+                  author,
+                  tags: tagsStr,
+                  description: desc.trim() ? desc : null,
+                  seriesName: seriesName.trim() ? seriesName : null,
+                  seriesOrder: seriesName.trim() && seriesOrder.trim() ? Number(seriesOrder) : null,
+                })
+              }
+            >
+              {busy ? "保存中…" : "保 存"}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -106,6 +106,7 @@ pub fn run() {
       commands::delete_book,
       commands::open_book_file,
       commands::upload_cover,
+      commands::read_image_file,
       commands::fetch_epub_cover,
       commands::list_sources,
       commands::add_clasp_sources,

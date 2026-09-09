@@ -309,8 +309,12 @@ export default function BookDetailPage() {
           error={metaError}
           llmReady={llmReady}
           onSave={onSaveMeta}
-          onClose={() => {
-            if (!metaBusy) setEditing(false);
+          onClose={(changed) => {
+            if (!metaBusy) {
+              setEditing(false);
+              // changed=true：封面已上传更新（DB 已换新 cover_path），刷新详情
+              if (changed) setRefresh((k) => k + 1);
+            }
           }}
         />
       )}

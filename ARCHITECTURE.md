@@ -319,7 +319,7 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 | `cancel_task` | 打断进行中的长任务（TaskRegistry 按 task_id 置位取消令牌） | 返回是否存在该任务 |
 | `delete_book` | 删除 DB 记录 + 书库 EPUB 副本 + 封面缓存（封面按引用计数，归零才删文件；原始导入文件不动） | 前端原生确认框 |
 | `update_book_meta` | 详情页编辑书名/作者/标签/简介，同步 EPUB 副本 | EPUB 写入失败仅降级更新 DB |
-| `upload_cover` | 手动封面替换：复制入 covers → 同步 EPUB 副本嵌入封面 → 更新 DB | EPUB 写入失败仅降级更新 DB |
+| `upload_cover` | 手动封面替换：复制入 covers → 同步 EPUB 副本嵌入封面 → 更新 DB（`read_image_file` 供前端裁剪预览读取原图字节） | EPUB 写入失败仅降级更新 DB；EditMetaModal 关闭时 `onClose(changed=true)` 触发详情刷新（封面经内容去重换新路径，不刷新页面会停留旧图） |
 | `get_settings` / `save_settings` | LLM 多 Provider（各含 Endpoint / API Key / 模型）+ 默认服务商/模型 + token 预算 + 模型价格表 + 用量与预估成本（逐模型 + 合计；`pricing_effective` 为"显式配置→内置预设"解析后的展示值） | 旧版单 provider 平铺配置自动迁移；名称去重校验；价格为非负数、按模型去重 |
 | `reset_llm_usage` | 清零 `llm_usage` 用量统计（预算周期重置；不影响书籍数据） | 前端确认框 |
 | `llm_status` | LLM 可用性预检（合并本简介导入前提示） | 未配置返回 configured=false |
@@ -342,6 +342,8 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 - 长任务进度统一监听 `task-progress` 事件；批量条可打断（停止剩余 + `cancel_task` 中断当前）。
 
 **导入交互细节**：加书弹窗承担交互确认职责 —— 书名/作者/标签可编辑（每字段带"翻译为中文"按钮，走 LLM）、展示封面、系列字段在确认步落库；无/多结果时进入搜索页（可改关键词、分页浏览、**按顺序多选 = 合并本**）；非中文书名必须确认后才可导入。「批量加书」为分裂按钮（点击选文件夹递归扫描，箭头/悬浮展开菜单），「唯一结果自动导入」开关在下拉菜单内（与 CLI batch 语义一致）。弹窗不启用"点击外部关闭"（避免拖拽选择文本时鼠标释放到蒙层误关）。
+
+**封面上传与截取**（`EditMetaModal`）：「上传封面…」选图后进入截取模式（`CoverCrop`）—— 固定 **2:3 视口**（与全应用封面展示比例一致）cover 式取景，拖动平移、滚轮/滑杆缩放（锚点缩放，`offset/scale` 反演到源图像素坐标，canvas 按原图分辨率抠取不放大）；PNG 源输出 PNG（保留透明）、其余输出 JPEG 0.92；可「使用原图」跳过截取。字节经 `save_dropped_file` 落临时文件后走既有 `upload_cover` 链（内容去重 + EPUB 同步 + DB 更新），成功后 `onClose(true)` 通知调用方刷新（详情页 `setRefresh` / 书虫 `mna:library-refresh`）。
 
 **书架交互细节**：视图三态（网格/列表=封面左信息右/仅封面）+ 封面大小三档（大/中/小，窄屏默认小），localStorage 持久化；排序（添加顺序/最近/书名/作者/系列，中文经 `Intl.Collator` 拼音序）；侧栏筛选（阅读状态/作者/标签，多作者按顿号拆分 facet）；多选批量操作（设状态/删除/合并模式=有序选择后合并）；阅读状态徽章可点击切换，切到"已读"弹短评询问（可与 AI 多轮讨论后生成）；**返回顶部浮动按钮**（滚离顶部显示 ↑，点击平滑回顶后变 ↓ 可返回原位，用户再次下滑自动重置 —— 下滑判定用滚动增量方向而非绝对位置，避免回顶动画误触发）；监听 `mna:library-refresh` CustomEvent 刷新书架（书虫写操作完成后广播）。
 
