@@ -357,6 +357,8 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 
 **方案**：`tauri.conf.json` 关闭 `dragDropEnabled` → WebView2 保持默认 `AllowExternalDrop=true` → Chromium 把外部拖拽转成标准 DragEvent。页面拿不到本地路径（浏览器安全限制，只有 File 内容）→ `webkitGetAsEntry` 递归展开文件/文件夹（readEntries 每批 ≤100，循环读到空）→ 逐个 `File.arrayBuffer()` → `save_dropped_file` 命令（**字节走 IPC 原始请求体**避免 JSON 序列化大数组；文件名 encodeURIComponent 后放 `filename` 请求头）落临时文件（`temp/drag-import/`，启动清扫）→ 拿到路径后复用路径式导入流程。`dragenter/leave` 计数驱动遮罩；`App.tsx` 全局拦截文件类拖放防止页面被导航替换。
 
+**进度条跨阶段连续显示**：读取（`batchProgress` 真进度条）→ 分析（单本接管文案"分析书籍信息"，含数秒网络匹配；「＋ 加书」按钮流程同样显示）→ 批量导入（`runBatch` 文案），全部结束后统一清理——分阶段清空会造成"闪一下就消失"的空窗。两个实证踩过的坑：① 读取/分析/批量是同一流程的续接段，**续接函数不得带 `addBusy` 守卫**（读取阶段 batchStatus 已置位 → addBusy 恒 true → 早退 → 只完成落盘、导入从未启动；并发防护只放在 HTML5 drop 入口）；② 临时文件名带 `{时间戳}-{序号}-` 前缀（保唯一），展示时经 `dropDisplayName` 剥离还原原始文件名。
+
 ### 14.4 书架滚动位置持久化
 
 localStorage `library.scrollY`；防抖 200ms 保存 + 卸载/pagehide 立即保存。三个必须用 ref 兜底的坑（全部实测踩过）：
@@ -492,6 +494,6 @@ model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 - `build-linux`（ubuntu-24.04）：webkit2gtk-4.1 依赖 + **deb/AppImage** + CLI（`APPIMAGE_EXTRACT_AND_RUN=1` 免 FUSE）；
 - `build-android`（ubuntu-latest）：runner 自带 Android SDK，补装 SDK 36/NDK 26 + JDK 17，`cargo tauri android build --apk --target aarch64 --target armv7` → 通用 APK；**签名**：gen/android 的 gradle 读环境变量 `KEYSTORE_FILE/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD`，CI 从 Secrets `KEYSTORE_BASE64`（解码为文件）等四项注入 —— 构建前 keytool 预检口令与别名（快速失败，不等全量编译后签名才炸），缺 Secrets 时明确报错；
 - `build-macos`（macos-latest，arm64）：`--target universal-apple-darwin` DMG（tauri 双架构 lipo 合并）+ CLI（手动 lipo 为 universal）；
-- `build-ios`（macos-latest）：`tauri ios init --ci` 现场生成 gen/apple + `xcodebuild -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO` → **未签名模拟器 zip**（真机需开发者证书重签）；
+- `build-ios`（macos-latest）：**Rust 编译检查**（`cargo build --target aarch64-apple-ios,aarch64-apple-ios-sim -p mystery-gui`，无产物）—— tauri 生成的 Xcode 工程的 Build Rust Code 阶段必须由 `tauri ios build/dev` 的服务进程编排（经临时目录 `{identifier}-server-addr` 文件通信），绕过 CLI 直接 `xcodebuild` 会在 read_options 处 panic；`ios build` 又面向真机且需签名（CLI 不支持模拟器目标）——故退化为编译验证（真机分发需 Apple 开发者证书经 Xcode 归档签名）；
 - `publish`：download-artifact 汇总（merge-multiple）→ `gh release create`：main push → 滚动 prerelease `continuous`（`--cleanup-tag` 删旧重建、`--target $GITHUB_SHA`）；`v*` 标签 → 正式 Release（需单独 `git push github v0.1.0`）；
 - 共性：tauri-cli 走 taiki-e/install-action 预编译（失败回退源码）、swatinem/rust-cache 缓存 Rust、setup-node 缓存 npm、并发去重（cancel-in-progress）；**gen/android 入库**（Manifest 权限/Kotlin 插件/签名配置，`gradlew` 在 git index 标记 755 —— Windows 提交默认丢执行位）。私有仓库注意 macOS runner 按 10 倍计费分钟数。

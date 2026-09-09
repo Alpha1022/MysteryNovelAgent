@@ -16,8 +16,9 @@
 #   build-linux      ubuntu-24.04：deb + AppImage + Linux CLI
 #   build-android    ubuntu-latest：aarch64 + armv7 通用 APK（签名见下）
 #   build-macos      macos-latest（arm64）：universal DMG + universal CLI
-#   build-ios        macos-latest：iOS 模拟器构建（未签名 zip，仅验证可编译；
-#                    真机安装需 Apple 开发者证书重新签名）
+#   build-ios        macos-latest：iOS Rust 编译检查（设备+模拟器双目标；
+#                    tauri 的 Xcode 工程须由 CLI 服务进程编排，直接
+#                    xcodebuild 不可行；无签名分发物，真机需开发者证书）
 #
 # Android 签名（gen/android 的 gradle 读环境变量 KEYSTORE_FILE /
 #   KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD；CI 侧由 Secrets 提供）：
@@ -278,16 +279,21 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- iOS
+  # 说明：tauri 生成的 Xcode 工程的「Build Rust Code」阶段必须由
+  # `tauri ios build/dev` 的服务进程编排（经临时目录 {identifier}-server-addr
+  # 文件通信）——绕过 CLI 直接 xcodebuild 会在 read_options 处 panic；
+  # 而 `tauri ios build` 面向真机归档且需要签名，CLI 不支持模拟器目标。
+  # 因此本 job 退为 Rust 侧编译检查（设备 + 模拟器双目标，即该 script
+  # 阶段内部执行的 cargo build），不产出可分发物 —— 真机安装需 Apple
+  # 开发者证书，经 Xcode 打开 gen/apple 归档签名。
   build-ios:
-    name: iOS（模拟器构建，未签名）
+    name: iOS（Rust 编译检查）
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # x86_64-apple-ios-sim 已从 Rust stable 发行版移除（弃用）；
-          # macos-latest 为 arm64 runner，模拟器只需 aarch64-apple-ios-sim
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -295,38 +301,12 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: 安装 tauri-cli（预编译）
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tauri
-        continue-on-error: true
-      - name: 安装 tauri-cli（源码兜底）
-        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
-      - name: 前端依赖
-        run: npm ci
+      # generate_context! 宏在编译期嵌入 frontend/dist（目录必须存在）
+      - name: 前端构建（编译期依赖）
+        run: npm ci && npm run build
         working-directory: frontend
-      # gen/apple 不入库（每次可再生），--ci 跳过交互提示
-      - name: 生成 iOS 工程
-        run: cargo tauri ios init --ci
-      # 无 Apple 开发者证书：直接 xcodebuild 打模拟器目标（绕过 tauri 的
-      # 签名导出流程），产物为未签名 .app（仅模拟器可装）
-      - name: xcodebuild（模拟器，未签名）
-        working-directory: src-tauri/gen/apple
-        run: |
-          set -eu
-          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/,""); print; exit}')
-          echo "scheme=${SCHEME}"
-          xcodebuild -scheme "$SCHEME" -configuration Release -sdk iphonesimulator -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-          APP=$(find build/Build/Products -name "*.app" -type d | head -n1)
-          if [ -z "$APP" ]; then echo "未找到 .app 产物"; exit 1; fi
-          # gen/apple 上三级到仓库根：src-tauri/gen/apple → ../.. = src-tauri → ../../.. = 根
-          mkdir -p ../../../dist
-          ditto -c -k --keepParent "$APP" ../../../dist/mystery-shelf-ios-simulator-arm64.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-ios
-          path: dist/*
-          if-no-files-found: error
+      - name: 编译 Rust（设备 + 模拟器双目标）
+        run: cargo build --release -p mystery-gui --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
   # -------------------------------------------------------------- 发布
   publish:
@@ -356,7 +336,7 @@ jobs:
           - Linux：deb / AppImage / CLI
           - Android：universal APK（arm64 + armv7）
           - macOS：universal DMG / CLI
-          - iOS：模拟器构建（未签名，仅验证可编译）"
+          - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）"
           else
             # 滚动预发布：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
             gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
@@ -370,7 +350,7 @@ jobs:
           - Linux：deb / AppImage / CLI
           - Android：universal APK（arm64 + armv7）
           - macOS：universal DMG / CLI
-          - iOS：模拟器构建（未签名，仅验证可编译）
+          - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）
 
           正式版本见 v* 标签的 Release。"
           fi
