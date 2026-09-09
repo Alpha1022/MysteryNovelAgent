@@ -538,6 +538,13 @@ export default function LibraryPage() {
   }, [refresh]);
 
   const shortName = (p: string) => p.split(/[\\/]/).pop() ?? p;
+  /** 展示名：HTML5 拖拽经 save_dropped_file 落盘的临时文件带 "{时间戳}-{序号}-"
+   * 前缀（保唯一），展示给用户时剥掉还原原始文件名；非临时路径原样返回 */
+  const dropDisplayName = (p: string) => {
+    const base = shortName(p);
+    const m = base.match(/^\d+-\d+-(.+)$/);
+    return m ? m[1] : base;
+  };
   const nextTaskId = () => `import-${Date.now()}-${++taskSeq.current}`;
   const isCancelledErr = (e: unknown) => String(e) === CANCELLED_MSG;
 
@@ -610,6 +617,8 @@ export default function LibraryPage() {
     if (!path) return;
 
     setAnalyzing(true);
+    // 分析含网络搜索（数秒）：与拖拽导入一致，显示进度条而非静默等待
+    setBatchStatus(`分析书籍信息：${shortName(path)}`);
     try {
       setPreview(await analyzeEpub(path));
     } catch (e) {
@@ -617,6 +626,7 @@ export default function LibraryPage() {
       setNotice(`加书失败：${shortName(path)} — ${String(e)}`);
     } finally {
       setAnalyzing(false);
+      setBatchStatus(null);
     }
   };
 
@@ -669,7 +679,7 @@ export default function LibraryPage() {
         pv = await analyzeEpub(path);
       } catch {
         fail++;
-        failed.push(shortName(path));
+        failed.push(dropDisplayName(path));
         continue;
       }
 
@@ -704,7 +714,7 @@ export default function LibraryPage() {
             skip++;
           } else {
             fail++;
-            failed.push(shortName(path));
+            failed.push(dropDisplayName(path));
           }
         } finally {
           batchCurrentTaskRef.current = null;
@@ -742,9 +752,12 @@ export default function LibraryPage() {
     }
   };
 
-  /** 拖拽导入：EPUB 文件走单本/批量流程（文件夹已在 HTML5 层展开） */
+  /** 拖拽导入：EPUB 文件走单本/批量流程（文件夹已在 HTML5 层展开）。
+   * 注意不加 addBusy 守卫：本函数是 handleHtml5Drop 的续接段（同一流程），
+   * 读取阶段 batchStatus 已置位会使 addBusy 恒为 true，加守卫会直接早退 ——
+   * 历史 bug：拖入文件只完成读取落盘，分析/导入从未启动（进度条闪一下即消失）。
+   * 并发防护由唯一入口 handleHtml5Drop 的 addBusy 检查承担。 */
   const handleDrop = async (paths: string[]) => {
-    if (addBusy) return;
     const epubs = paths.filter((p) => p.toLowerCase().endsWith(".epub"));
     if (epubs.length === 0) {
       setNotice("拖拽内容中没有 EPUB 文件或文件夹");
@@ -755,11 +768,13 @@ export default function LibraryPage() {
     setError(null);
     if (epubs.length === 1) {
       setAnalyzing(true);
+      // 分析含网络搜索（数秒）：接管进度条文案，让用户知道正在干什么
+      setBatchStatus(`分析书籍信息：${dropDisplayName(epubs[0])}`);
       try {
         setPreview(await analyzeEpub(epubs[0]));
       } catch (e) {
         // 分析失败不阻断书架展示
-        setNotice(`加书失败：${shortName(epubs[0])} — ${String(e)}`);
+        setNotice(`加书失败：${dropDisplayName(epubs[0])} — ${String(e)}`);
       } finally {
         setAnalyzing(false);
       }
@@ -843,13 +858,16 @@ export default function LibraryPage() {
     setWarnNotice(null);
     setError(null);
     batchCancelRef.current = false;
+    setBatchProgress({ current: 0, total: files.length });
     setBatchStatus(`读取拖入的 ${files.length} 个文件…`);
     const paths: string[] = [];
     try {
-      for (const f of files) {
+      for (let i = 0; i < files.length; i++) {
         // 用户打断：停止读取剩余文件
         if (batchCancelRef.current) break;
-        setBatchStatus(`读取拖入文件（${paths.length + 1}/${files.length}）：${f.name}`);
+        const f = files[i];
+        setBatchProgress({ current: i + 1, total: files.length });
+        setBatchStatus(`读取拖入文件（${i + 1}/${files.length}）：${f.name}`);
         try {
           const bytes = new Uint8Array(await f.arrayBuffer());
           paths.push(await saveDroppedFile(f.name, bytes));
@@ -857,11 +875,19 @@ export default function LibraryPage() {
           setError(`读取拖入文件失败：${f.name} — ${String(e)}`);
         }
       }
+      if (batchCancelRef.current) {
+        setNotice("拖拽导入已打断");
+        return;
+      }
+      if (paths.length === 0) return;
+      // 进度条跨阶段连续显示：读取 → 分析（单本）/ 批量导入（多本）由下游
+      // 流程接管文案，全部结束后才在 finally 统一清理 —— 避免分阶段清空
+      // 造成"闪一下就消失"的空窗（分析含数秒网络匹配，此前是静默的）
+      await handleDropRef.current(paths);
     } finally {
       setBatchStatus(null);
+      setBatchProgress(null);
     }
-    if (paths.length === 0) return;
-    await handleDropRef.current(paths);
   };
 
   // HTML5 拖拽事件（仅注册一次；经 ref 调用最新处理函数）
