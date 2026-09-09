@@ -2,13 +2,13 @@
 # GitHub Actions：全平台自动构建与发布
 #
 # 推送方式（本地分支 master → GitHub main）：
-#   git push github master:main        # 滚动构建 + 维护 continuous 预发布
+#   git push github master:main        # 滚动构建 + 维护 continuous Release
 #   git push github v0.1.0             # 正式 Release（需先在本地打 tag）
 #
 # 触发时机：
 #   - push 到 main / 手动触发 → 构建五平台产物：
 #     ① 上传 workflow artifacts（90 天）
-#     ② 维护滚动预发布 Release（tag 固定为 continuous，指向最新提交）
+#     ② 维护滚动 Release（tag 固定为 continuous，指向最新提交）
 #   - 推送 v* 标签 → 正式 Release（全部产物挂到该版本）
 #
 # 构建矩阵（GitHub 托管 runner，原生环境无需交叉编译）：
@@ -342,11 +342,10 @@ jobs:
           - macOS：universal DMG / CLI
           - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）"
           else
-            # 滚动预发布：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
+            # 滚动 Release（正式版，非预发布）：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
             gh release delete continuous -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
             gh release create continuous dist/* \
               -R "$REPO" \
-              --prerelease \
               --target "$GITHUB_SHA" \
               --title "Latest build (${GITHUB_SHA::7})" \
               --notes "main 分支最新构建（每次 push 自动更新）。
