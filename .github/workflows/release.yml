@@ -286,7 +286,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios-sim
+          # x86_64-apple-ios-sim 已从 Rust stable 发行版移除（弃用）；
+          # macos-latest 为 arm64 runner，模拟器只需 aarch64-apple-ios-sim
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
