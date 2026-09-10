@@ -1576,31 +1576,31 @@ pub fn get_llm_usage(conn: &Connection) -> SqlResult<Vec<LlmUsageRow>> {
   rows.collect()
 }
 
-/// 全部模型的累计 token 总量（预算检查 / 设置页预算进度条用）
-pub fn llm_usage_total(conn: &Connection) -> SqlResult<i64> {
-  conn.query_row("SELECT COALESCE(SUM(total_tokens), 0) FROM llm_usage", [], |r| {
-    r.get(0)
-  })
+/// 按数据库路径读取用量行（model, prompt_tokens, completion_tokens）
+///
+/// 供封面/预算等无 Connection 上下文的检查使用：打开只读连接做短查询；
+/// 文件不存在 / 读失败返回空（统计不可用不应阻断调用）。
+pub fn llm_usage_rows_at(path: &Path) -> Vec<(String, i64, i64)> {
+  let Ok(conn) = Connection::open(path) else {
+    return Vec::new();
+  };
+  let Ok(mut stmt) =
+    conn.prepare("SELECT model, COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0) FROM llm_usage")
+  else {
+    return Vec::new();
+  };
+  stmt
+    .query_map([], |r| {
+      Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
 }
 
 /// 清零用量统计（设置页「清零用量」按钮；预算周期重置用）
 pub fn reset_llm_usage(conn: &Connection) -> SqlResult<()> {
   conn.execute("DELETE FROM llm_usage", [])?;
   Ok(())
-}
-
-/// 按数据库路径读取累计 token 总量（agent 预算检查用：无 Connection 上下文）
-///
-/// 打开只读连接做短查询；文件不存在 / 读失败返回 0（统计不可用不应阻断调用）。
-pub fn llm_usage_total_at(path: &Path) -> i64 {
-  let Ok(conn) = Connection::open(path) else {
-    return 0;
-  };
-  conn
-    .query_row("SELECT COALESCE(SUM(total_tokens), 0) FROM llm_usage", [], |r| {
-      r.get(0)
-    })
-    .unwrap_or(0)
 }
 
 #[cfg(test)]

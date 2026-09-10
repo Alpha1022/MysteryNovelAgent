@@ -230,7 +230,7 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 
 **调用策略**：
 - 超时 30s；重试次数取 `llm.retry_count`（默认 2，最大 10），**只对可重试错误**（网络错误 / HTTP 429 / 5xx）指数退避 —— 参数错误、鉴权失败、预算超限重试无意义；
-- **预算咽喉**：`chat_with_tools_timeout` 是所有 LLM 调用（chat/融合/翻译/书虫循环）的唯一入口，每次调用前读 `llm.budget_tokens` 与 `llm_usage` 累计用量，达到预算立即返回 `LlmError::Budget`（不可重试；用量按次入库，多轮 agent 每轮都会重新检查 → 达到预算自动中断）。DB 读失败按 0 用量放行（统计故障不阻断功能）；
+- **预算咽喉**：`chat_with_tools_timeout` 是所有 LLM 调用（chat/融合/翻译/书虫循环）的唯一入口，每次调用前把 `llm_usage` 累计用量按价格表换算成成本（元）与 `llm.budget_rmb` 比较，达到预算立即返回 `LlmError::Budget`（不可重试；用量按次入库，多轮 agent 每轮都会重新检查 → 达到预算自动中断）。DB 读失败按 0 成本放行（统计故障不阻断功能）；
 - 每次调用产出 `TokenUsage`（输入/输出/总量取自 API 响应的 `usage` 字段），按 `"provider/model"` 主键 UPSERT 累计入 `llm_usage`（GUI 设置页可见用量与成本）；
 - **成本换算**：`LlmSettings::price_for` 按 "显式配置（`[[llm.pricing]]`，元/百万 tokens）精确匹配 → 内置预设表 `PRESET_PRICING` 最长前缀匹配" 解析价格；成本 = 输入量×输入价 + 输出量×输出价，设置页逐模型与合计展示；`reset_llm_usage` 清零用量（预算周期重置）；
 - 带工具调用（`chat_with_tools`，书虫用）与不带工具两个入口。
@@ -469,7 +469,7 @@ username = "…"; password = "…"    # 应用专用密码；remote_dir = "myste
 
 [llm]                            # GUI 设置页写入；优先于 OPENAI_* 环境变量
 default_provider = "DeepSeek"; default_model = "deepseek-chat"; retry_count = 2
-budget_tokens = 5000000          # Token 预算：累计用量达到后拒绝新的 LLM 调用（缺省不限）
+budget_rmb = 20.0                 # 花费预算（元）：累计成本达到后拒绝新的 LLM 调用（缺省不限）
 [[llm.providers]]
 name = "DeepSeek"; base_url = "https://api.deepseek.com/v1"
 api_key = "sk-…"; models = ["deepseek-chat"]

@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -3429,9 +3429,9 @@ pub struct LlmSettingsDto {
   /// LLM 调用失败重试次数（None = 默认 2）
   #[serde(default)]
   pub retry_count: Option<u32>,
-  /// Token 预算（累计用量达到后拒绝新的 LLM 调用；None = 不限）
+  /// 花费预算（元）：累计成本按价格表换算，达到预算后拒绝新的 LLM 调用；None = 不限
   #[serde(default)]
-  pub budget_tokens: Option<i64>,
+  pub budget_rmb: Option<f64>,
   /// 模型价格表（空输入/输出价的行在保存时丢弃）
   #[serde(default)]
   pub pricing: Vec<ModelPricingDto>,
@@ -3457,8 +3457,10 @@ pub struct SettingsDto {
   pub usage: Vec<LlmUsageDto>,
   /// 全模型累计 token 总量
   pub usage_total_tokens: i64,
-  /// 全模型累计预估成本（任一模型缺价格时仍汇总已知部分；全部未知为 None）
+  /// 全模型累计预估成本（至少一个模型有价格时为已知部分的和；全部未知为 None）
   pub usage_total_cost: Option<f64>,
+  /// 未定价模型的用量行数（成本/预算不含其用量，UI 据此提示）
+  pub usage_unpriced: usize,
   /// 生效价格表（显式配置 → 内置预设解析后的展示值；仅供编辑器预填展示）
   pub pricing_effective: Vec<ModelPricingDto>,
 }
@@ -3494,12 +3496,11 @@ pub async fn get_settings(
   };
   let usage_dto: Vec<LlmUsageDto> = usage.iter().map(|r| usage_row_to_dto(r, &cfg.llm)).collect();
   let usage_total_tokens: i64 = usage.iter().map(|r| r.total_tokens).sum();
-  // 全部行都有价格时才给出总成本（有未知价格的模型时部分汇总会误导）
-  let usage_total_cost = if usage_dto.is_empty() {
-    None
-  } else {
-    usage_dto.iter().map(|r| r.cost).collect::<Option<Vec<f64>>>().map(|v| v.iter().sum())
-  };
+  // 累计成本：已知价格的行求和（未知价格模型计 0，不计入——避免误导）
+  // 同时统计未定价行数，前端据此提示"预算/成本不含其用量"
+  let priced: Vec<f64> = usage_dto.iter().filter_map(|r| r.cost).collect();
+  let usage_total_cost = (!priced.is_empty()).then(|| priced.iter().sum());
+  let usage_unpriced = usage_dto.iter().filter(|r| r.cost.is_none()).count();
   // 生效价格表：服务商模型 ∪ 有用量记录的模型（去掉 provider 前缀），按当前规则解析
   let mut effective_models: Vec<String> = Vec::new();
   for p in &cfg.llm.providers {
@@ -3540,7 +3541,7 @@ pub async fn get_settings(
       default_provider: cfg.llm.default_provider,
       default_model: cfg.llm.default_model,
       retry_count: cfg.llm.retry_count,
-      budget_tokens: cfg.llm.budget_tokens,
+      budget_rmb: cfg.llm.budget_rmb,
       pricing: cfg
         .llm
         .pricing
@@ -3555,6 +3556,7 @@ pub async fn get_settings(
     usage: usage_dto,
     usage_total_tokens,
     usage_total_cost,
+    usage_unpriced,
     pricing_effective,
   })
 }
@@ -3623,8 +3625,8 @@ pub fn save_settings(settings: LlmSettingsDto) -> Result<(), String> {
     default_model,
     // 重试次数：0~10，越界截断
     retry_count: settings.retry_count.map(|r| r.min(10)),
-    // 预算：正值生效，非正值视为未设置
-    budget_tokens: settings.budget_tokens.filter(|b| *b > 0),
+    // 预算：正值生效（元），非正值视为未设置
+    budget_rmb: settings.budget_rmb.filter(|b| b.is_finite() && *b > 0.0),
     // 价格表：模型名非空、价格为非负数才保留；按模型名去重（后者覆盖前者）
     pricing: {
       let mut out: Vec<mystery_novel_agent::config::ModelPricing> = Vec::new();

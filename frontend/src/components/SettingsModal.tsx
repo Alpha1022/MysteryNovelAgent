@@ -44,10 +44,11 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const [defaultProvider, setDefaultProvider] = useState<string | null>(null);
   const [defaultModel, setDefaultModel] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState<number | null>(2);
-  const [budgetTokens, setBudgetTokens] = useState<number | null>(null);
+  const [budgetRmb, setBudgetRmb] = useState<number | null>(null);
   const [usage, setUsage] = useState<LlmUsageRow[]>([]);
   const [usageTotalTokens, setUsageTotalTokens] = useState(0);
   const [usageTotalCost, setUsageTotalCost] = useState<number | null>(null);
+  const [usageUnpriced, setUsageUnpriced] = useState(0);
   /**
    * 价格编辑表（model → 输入/输出价）。
    * 显式配置（pricing）优先展示；未配置的行展示后端解析的生效价
@@ -107,10 +108,11 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
         setDefaultProvider(s.llm.default_provider);
         setDefaultModel(s.llm.default_model);
         setRetryCount(s.llm.retry_count ?? 2);
-        setBudgetTokens(s.llm.budget_tokens);
+        setBudgetRmb(s.llm.budget_rmb);
         setUsage(s.usage);
         setUsageTotalTokens(s.usage_total_tokens);
         setUsageTotalCost(s.usage_total_cost);
+        setUsageUnpriced(s.usage_unpriced);
         setPricing(s.llm.pricing);
         setPricingEffective(s.pricing_effective);
         setLibraries(cfg.libraries);
@@ -133,6 +135,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
       setUsage(s.usage);
       setUsageTotalTokens(s.usage_total_tokens);
       setUsageTotalCost(s.usage_total_cost);
+        setUsageUnpriced(s.usage_unpriced);
     } catch (e) {
       setError(String(e));
     }
@@ -204,7 +207,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
         default_provider: defaultProvider,
         default_model: defaultModel,
         retry_count: retryCount,
-        budget_tokens: budgetTokens,
+        budget_rmb: budgetRmb,
         pricing,
       });
       setSaved(true);
@@ -593,19 +596,19 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               </label>
 
               <label className="modal-label">
-                Token 预算（累计用量达到后自动中断 LLM 调用；留空 = 不限）
+                花费预算（元，累计成本达到后自动中断 LLM 调用；留空 = 不限）
                 <input
                   type="number"
                   min={0}
-                  step={10000}
-                  value={budgetTokens ?? ""}
-                  placeholder="如 5000000"
+                  step={0.5}
+                  value={budgetRmb ?? ""}
+                  placeholder="如 20"
                   onChange={(e) => {
                     const n = Number(e.target.value);
-                    setBudgetTokens(
+                    setBudgetRmb(
                       e.target.value === "" || Number.isNaN(n) || n <= 0
                         ? null
-                        : Math.floor(n),
+                        : n,
                     );
                   }}
                   disabled={saving}
@@ -624,37 +627,45 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               <div className="usage-block">
                 <h2>Token 用量与成本</h2>
 
-                {/* 预算进度 */}
+                {/* 预算进度（按累计成本换算） */}
                 <div className="budget-bar">
                   <div className="budget-text">
                     累计 {usageTotalTokens.toLocaleString()} tokens
                     {usageTotalCost != null && ` · 预估成本 ${fmtCost(usageTotalCost)}`}
-                    {budgetTokens
-                      ? ` · 预算 ${budgetTokens.toLocaleString()}（${Math.min(
-                          100,
-                          Math.round((usageTotalTokens / budgetTokens) * 100),
-                        )}%）`
+                    {budgetRmb
+                      ? ` · 预算 ¥${budgetRmb}（${
+                          usageTotalCost != null
+                            ? Math.min(100, Math.round((usageTotalCost / budgetRmb) * 100))
+                            : 0
+                        }%）`
                       : " · 未设置预算"}
-                    {budgetTokens && usageTotalTokens >= budgetTokens && (
-                      <span className="budget-exceeded"> · 已达预算，LLM 调用已中断</span>
-                    )}
+                    {budgetRmb != null &&
+                      usageTotalCost != null &&
+                      usageTotalCost >= budgetRmb && (
+                        <span className="budget-exceeded"> · 已达预算，LLM 调用已中断</span>
+                      )}
                   </div>
-                  {budgetTokens != null && budgetTokens > 0 && (
+                  {budgetRmb != null && budgetRmb > 0 && (
                     <div className="progress-bar batch">
                       <div
-                        className={`progress-fill ${usageTotalTokens >= budgetTokens ? "over" : ""}`}
+                        className={`progress-fill ${
+                          usageTotalCost != null && usageTotalCost >= budgetRmb ? "over" : ""
+                        }`}
                         style={{
-                          width: `${Math.min(
-                            100,
-                            Math.round((usageTotalTokens / budgetTokens) * 100),
-                          )}%`,
+                          width: `${
+                            usageTotalCost != null
+                              ? Math.min(100, Math.round((usageTotalCost / budgetRmb) * 100))
+                              : 0
+                          }%`,
                         }}
                       />
                     </div>
                   )}
                   <div className="budget-hint">
-                    每次调用按响应中的用量精确累计；成本按下方价格表换算。
-                    {budgetTokens
+                    每次调用按响应中的用量精确累计，成本按下方价格表换算（元）。
+                    {usageUnpriced > 0 &&
+                      ` ${usageUnpriced} 个模型未定价，预算与成本不含其用量。`}
+                    {budgetRmb
                       ? " 达到预算后所有 LLM 功能自动中断（融合/翻译降级、书虫报错），清零用量或调整预算后恢复。"
                       : ""}
                   </div>

@@ -122,9 +122,9 @@ pub struct LlmSettings {
   /// LLM 调用失败重试次数（None = 默认 2 次；0 = 不重试，最大 10）
   #[serde(default)]
   pub retry_count: Option<u32>,
-  /// Token 预算（累计 total_tokens 达到预算后拒绝新的 LLM 调用；None = 不限）
+  /// 花费预算（元）：累计成本按价格表换算，达到预算后拒绝新的 LLM 调用；None = 不限
   #[serde(default)]
-  pub budget_tokens: Option<i64>,
+  pub budget_rmb: Option<f64>,
   /// 模型价格表（元 / 百万 tokens；精确匹配优先于内置预设）
   #[serde(default)]
   pub pricing: Vec<ModelPricing>,
@@ -160,15 +160,31 @@ impl LlmSettings {
       .map(|(_, i, o)| (*i, *o))
   }
 
-  /// 预算检查（纯函数）：累计用量达到预算时返回错误信息
-  pub fn budget_error(&self, used_total: i64) -> Option<String> {
-    let budget = self.budget_tokens?;
-    if budget <= 0 {
+  /// 累计成本（元）：逐行按价格表换算后求和。
+  ///
+  /// `rows` 形如 (model, prompt_tokens, completion_tokens)，model 兼容
+  /// "provider/model" 统计键；无价格配置的模型计 0 —— 预算不含其用量
+  ///（设置页会警示未定价模型数量，或为其补配价格）。
+  pub fn usage_cost_rmb(&self, rows: &[(String, i64, i64)]) -> f64 {
+    rows
+      .iter()
+      .map(|(m, p, c)| {
+        self
+          .price_for(m)
+          .map_or(0.0, |(i, o)| *p as f64 * i / 1e6 + *c as f64 * o / 1e6)
+      })
+      .sum()
+  }
+
+  /// 花费预算检查（纯函数）：累计成本（元）达到预算时返回错误信息
+  pub fn budget_error(&self, used_cost: f64) -> Option<String> {
+    let budget = self.budget_rmb?;
+    if budget <= 0.0 {
       return None;
     }
-    if used_total >= budget {
+    if used_cost >= budget {
       Some(format!(
-        "已达 token 预算上限（累计 {used_total} / 预算 {budget}）。\
+        "已达 LLM 花费预算（已用 ¥{used_cost:.2} / 预算 ¥{budget:.2}）。\
          可在「设置 → LLM」调整预算或清零用量后重试"
       ))
     } else {

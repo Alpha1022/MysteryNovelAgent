@@ -253,8 +253,8 @@ export interface LlmSettings {
   default_model: string | null;
   /** 调用失败重试次数（null = 默认 2；0 = 不重试） */
   retry_count: number | null;
-  /** Token 预算（累计用量达到后拒绝新的 LLM 调用；null = 不限） */
-  budget_tokens: number | null;
+  /** 花费预算（元）：累计成本按价格表换算，达到后拒绝新的 LLM 调用；null = 不限 */
+  budget_rmb: number | null;
   /** 模型价格表（元 / 百万 tokens） */
   pricing: ModelPricing[];
 }
@@ -318,8 +318,10 @@ export interface SettingsInfo {
   usage: LlmUsageRow[];
   /** 全模型累计 token 总量 */
   usage_total_tokens: number;
-  /** 全模型累计预估成本（元；任一模型缺价格时为 null） */
+  /** 全模型累计预估成本（元；至少一个模型有价格时为已知部分之和，全部未知为 null） */
   usage_total_cost: number | null;
+  /** 未定价模型的用量行数（成本/预算不含其用量） */
+  usage_unpriced: number;
   /** 生效价格表（显式配置 → 内置预设；编辑器预填展示用） */
   pricing_effective: ModelPricing[];
 }

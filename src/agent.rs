@@ -240,12 +240,18 @@ pub async fn chat_with_tools_timeout(
 ) -> Result<ChatOutcome, LlmError> {
   let app_cfg = crate::config::AppConfig::load();
   // 预算检查（所有 LLM 调用的统一咽喉：chat/融合/翻译/书虫循环都经过这里）。
-  // 用量按次入库，多轮 agent 每轮调用前都会重新检查 → 达到预算自动中断。
-  // 数据库不可读时按 0 用量放行（统计故障不应阻断功能）。
-  if let Some(msg) = app_cfg.llm.budget_error(crate::db::llm_usage_total_at(
-    &app_cfg.database_file(),
-  )) {
-    return Err(LlmError::Budget(msg));
+  // 累计用量按价格表换算成成本（元）后与 llm.budget_rmb 比较；用量按次入库，
+  // 多轮 agent 每轮调用前都会重新检查 → 达到预算自动中断。
+  // 未定价模型计 0（预算不含其用量，设置页警示）；DB 读失败按 0 放行（统计故障不应阻断功能）。
+  if let Some(budget) = app_cfg.llm.budget_rmb.filter(|b| *b > 0.0) {
+    let used = app_cfg.llm.usage_cost_rmb(&crate::db::llm_usage_rows_at(
+      &app_cfg.database_file(),
+    ));
+    if used >= budget {
+      return Err(LlmError::Budget(format!(
+        "已达 LLM 花费预算（已用 ¥{used:.2} / 预算 ¥{budget:.2}）。可在「设置 → LLM」调整预算或清零用量"
+      )));
+    }
   }
   let retries = app_cfg
     .llm
@@ -474,20 +480,20 @@ mod tests {
     }
   }
 
-  /// 预算检查：达到/超过预算返回错误信息，未达或未配置预算放行
+  /// 花费预算检查：累计成本（元）达到预算时返回错误信息
   #[test]
   fn test_budget_error() {
-    let s = LlmSettings { budget_tokens: Some(1000), ..Default::default() };
-    assert!(s.budget_error(999).is_none());
-    let msg = s.budget_error(1000).unwrap();
-    assert!(msg.contains("1000"), "信息应含预算值: {msg}");
-    assert!(s.budget_error(5000).is_some());
+    let s = LlmSettings { budget_rmb: Some(10.0), ..Default::default() };
+    assert!(s.budget_error(9.99).is_none());
+    let msg = s.budget_error(10.0).unwrap();
+    assert!(msg.contains("10.00"), "信息应含预算值: {msg}");
+    assert!(s.budget_error(50.0).is_some());
 
     // 未配置预算 / 预算非正数 → 永不放行拦截
     let s2 = LlmSettings::default();
-    assert!(s2.budget_error(i64::MAX).is_none());
-    let s3 = LlmSettings { budget_tokens: Some(0), ..Default::default() };
-    assert!(s3.budget_error(99999).is_none());
+    assert!(s2.budget_error(f64::MAX).is_none());
+    let s3 = LlmSettings { budget_rmb: Some(0.0), ..Default::default() };
+    assert!(s3.budget_error(99999.0).is_none());
   }
 
   /// 预算错误不可重试（重试只会继续撞墙）
