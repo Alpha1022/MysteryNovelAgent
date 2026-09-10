@@ -1,7 +1,7 @@
 # ============================================================================
-# GitLab CI：自动构建与发布（GitLab 侧仅构建 Linux CLI + Windows；
-# Android / macOS / iOS 的完整构建矩阵在 GitHub Actions，
-# 见 .github/workflows/release.yml）
+# GitLab CI：自动构建与发布（GitLab 侧仅构建 Windows GUI 安装包；
+# CLI 已弃用不再构建分发；Android / macOS / iOS 的构建矩阵在
+# GitHub Actions，见 .github/workflows/release.yml）
 #
 # 触发时机：
 #   - 默认分支每次 push / 手动触发 → 构建全部产物并：
@@ -14,8 +14,7 @@
 # 不会再触发 tag 流水线（否则无限循环且 Release 创建撞 409）。
 #
 # 自动构建矩阵（Linux Docker runner）：
-#   build:linux-cli   Linux CLI（原生构建）
-#   build:windows     Windows：Tauri NSIS 安装包 + CLI
+#   build:windows     Windows：Tauri NSIS 安装包
 #                     （cargo-xwin 交叉编译，tauri 官方 Linux→Windows 方案）
 # ============================================================================
 
@@ -41,31 +40,7 @@ variables:
   PKG_NAME: "mystery-novel-agent"
   WIN_TARGET: "x86_64-pc-windows-msvc"
 
-# ---------------------------------------------------------------- CLI (Linux)
-build:linux-cli:
-  stage: build
-  image: rust:1-bookworm
-  interruptible: true
-  timeout: 90m
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-    - if: '$CI_COMMIT_TAG =~ /^v/'
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-  cache:
-    key: cargo-registry-linux
-    paths:
-      - .cargo-home/registry/
-      - .cargo-home/git/
-  script:
-    - cargo build --release --locked -p mystery-novel-agent
-    - mkdir -p dist
-    - cp target/release/mystery-novel-agent "dist/${PKG_NAME}-linux-amd64"
-  artifacts:
-    paths:
-      - dist/
-    expire_in: 1 week
-
-# ------------------------------------------- GUI 安装包 + CLI (Linux 交叉编译)
+# ------------------------------------------- GUI 安装包（Linux 交叉编译）
 build:windows:
   stage: build
   image: rust:1-bookworm
@@ -96,12 +71,9 @@ build:windows:
     - cd frontend && npm ci --cache .npm --prefer-offline && cd ..
     # GUI：NSIS 安装包（tauri.conf.json 的 beforeBuildCommand 自动构建前端）
     - cargo tauri build --runner cargo-xwin --target "$WIN_TARGET" --bundles nsis
-    # CLI：Windows 版可执行文件
-    - cargo xwin build --release --locked -p mystery-novel-agent --target "$WIN_TARGET"
     - mkdir -p dist
     # 产物统一 ASCII 命名（避免非 ASCII 文件名进 API / 下载链接）
     - cp "target/${WIN_TARGET}/release/bundle/nsis/"*-setup.exe dist/mystery-shelf-windows-x64-setup.exe
-    - cp "target/${WIN_TARGET}/release/mystery-novel-agent.exe" "dist/${PKG_NAME}-windows-x64.exe"
   artifacts:
     paths:
       - dist/
@@ -114,8 +86,6 @@ publish:continuous:
   stage: publish
   image: curlimages/curl:latest
   needs:
-    - job: build:linux-cli
-      artifacts: true
     - job: build:windows
       artifacts: true
   rules:
@@ -149,7 +119,7 @@ publish:continuous:
       curl -s -o /dev/null -w "  tag DELETE: HTTP %{http_code}\n" -X DELETE \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" "${API}/repository/tags/continuous" || true
       echo "创建 continuous Release…"
-      BODY="{\"tag_name\":\"continuous\",\"ref\":\"${CI_COMMIT_SHA}\",\"name\":\"Latest build (${CI_COMMIT_SHORT_SHA})\",\"description\":\"默认分支最新构建（每次 push 自动更新）。\\n\\n- Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）\\n- CLI：Linux / Windows\\n\\nAndroid / macOS / iOS 产物在 GitHub Releases；正式版本见 v* 标签的 Release。\",\"assets\":{\"links\":${LINKS}}}"
+      BODY="{\"tag_name\":\"continuous\",\"ref\":\"${CI_COMMIT_SHA}\",\"name\":\"Latest build (${CI_COMMIT_SHORT_SHA})\",\"description\":\"默认分支最新构建（每次 push 自动更新）。\\n\\n- Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）\\n\\nAndroid / macOS / iOS 产物在 GitHub Releases；正式版本见 v* 标签的 Release。\",\"assets\":{\"links\":${LINKS}}}"
       code=$(curl -s -o /tmp/rel.json -w "%{http_code}" -X POST \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
         --header "Content-Type: application/json" \
@@ -169,8 +139,6 @@ publish:release:
   stage: publish
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
-    - job: build:linux-cli
-      artifacts: true
     - job: build:windows
       artifacts: true
   rules:
@@ -193,5 +161,5 @@ publish:release:
       release-cli create \
         --name "Release ${CI_COMMIT_TAG}" \
         --tag-name "${CI_COMMIT_TAG}" \
-        --description "标签 ${CI_COMMIT_TAG} 的自动构建产物：Windows 安装包（NSIS）+ Linux / Windows CLI。Android / macOS / iOS 产物见 GitHub Releases。" \
+        --description "标签 ${CI_COMMIT_TAG} 的自动构建产物：Windows 安装包（NSIS）。Android / macOS / iOS 产物见 GitHub Releases。" \
         $ASSET_ARGS

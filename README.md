@@ -1,6 +1,6 @@
 # 推理小说阅读管理助手
 
-本地优先的书籍管理工具：**Rust CLI + Tauri GUI（Windows 桌面 / Android）**。
+本地优先的书籍管理工具：**Tauri GUI（Windows 桌面 / Android）**，附带的 Rust CLI 已弃用（源码保留，见[下文](#cli已弃用)）。
 导入 EPUB 时自动完成元数据增强（claspclub 匹配、LLM 简介融合、封面抓取、豆瓣短评精选），
 提供统一拼音命名书库、豆瓣短评知识库、系列合并、内置阅读器、WebDav 多设备同步与"书虫"AI 阅读助手。
 以推理小说为主要场景，但**同样适用于其他类型书籍**（手动提供豆瓣链接即可，见[下文](#不止推理小说)）。
@@ -66,7 +66,12 @@ cargo build --manifest-path src-tauri/Cargo.toml --features tauri/custom-protoco
 - **设置**：左上角「设 置」—— 书库 / LLM / WebDav 三页签。
   LLM 未配置时一切功能照常（简介直接拼接、书评手动输入），只是少了 AI 增强。
 
-### CLI
+### CLI（已弃用）
+
+> ⚠️ **CLI 已弃用**：不再通过 CI 构建与发布，新功能只进 GUI。
+> 源码保留（`src/main.rs`，核心库与 GUI 共用），有需要可自行编译：
+> `cargo build --release`（产物 `target/release/mystery-novel-agent(.exe)`）。
+> 既有命令与行为不变，文档保留供参考。
 
 ```bash
 cargo run -- add <EPUB 或文件夹>            # 导入并增强元数据（文件夹 = 批量）
@@ -154,11 +159,11 @@ cargo tauri android build       # 产出 APK/AAB
 >   需在系统设置中授予应用「所有文件访问」权限 —— 同步遇写入失败时会弹窗引导一键跳转授权页；
 > - 不想授予权限的话，把书库目录设为应用私有目录即可（`fs_roots` 中的应用数据目录），无需任何授权。
 
-### 仅 CLI
+### 仅 CLI（已弃用）
 
 ```bash
+# CLI 已弃用（不随 CI 构建发布），以下为自行编译方式；产物：target/release/mystery-novel-agent(.exe)
 cargo build --release
-# 产物：target/release/mystery-novel-agent(.exe)
 ```
 
 ### 测试与静态检查

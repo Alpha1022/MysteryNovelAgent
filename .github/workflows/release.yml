@@ -11,11 +11,12 @@
 #     ② 维护滚动 Release（tag 固定为 continuous，指向最新提交）
 #   - 推送 v* 标签 → 正式 Release（全部产物挂到该版本）
 #
-# 构建矩阵（GitHub 托管 runner，原生环境无需交叉编译）：
-#   build-windows    windows-latest：Tauri NSIS 安装包 + Windows CLI
-#   build-linux      ubuntu-24.04：deb + AppImage + Linux CLI
+# 构建矩阵（GitHub 托管 runner，原生环境无需交叉编译；
+# CLI 已弃用不再构建分发，见 README）：
+#   build-windows    windows-latest：Tauri NSIS 安装包
+#   build-linux      ubuntu-24.04：deb + AppImage
 #   build-android    ubuntu-latest：aarch64 + armv7 通用 APK（签名见下）
-#   build-macos      macos-latest（arm64）：universal DMG + universal CLI
+#   build-macos      macos-latest（arm64）：universal DMG
 #   build-ios        macos-latest：iOS Rust 编译检查（设备+模拟器双目标；
 #                    tauri 的 Xcode 工程须由 CLI 服务进程编排，直接
 #                    xcodebuild 不可行；无签名分发物，真机需开发者证书）
@@ -58,7 +59,7 @@ env:
 jobs:
   # ------------------------------------------------------------ Windows
   build-windows:
-    name: Windows（NSIS + CLI）
+    name: Windows（NSIS 安装包）
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -84,14 +85,11 @@ jobs:
         working-directory: frontend
       - name: 构建 GUI（NSIS 安装包）
         run: cargo tauri build --bundles nsis
-      - name: 构建 CLI
-        run: cargo build --release --locked -p mystery-novel-agent
       - name: 收集产物
         shell: bash
         run: |
           mkdir -p dist
           cp target/release/bundle/nsis/*-setup.exe dist/mystery-shelf-windows-x64-setup.exe
-          cp target/release/mystery-novel-agent.exe dist/mystery-novel-agent-windows-x64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: dist-windows
@@ -100,7 +98,7 @@ jobs:
 
   # -------------------------------------------------------------- Linux
   build-linux:
-    name: Linux（deb/AppImage + CLI）
+    name: Linux（deb/AppImage）
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -137,14 +135,11 @@ jobs:
         working-directory: frontend
       - name: 构建 GUI（deb + AppImage）
         run: cargo tauri build --bundles deb,appimage
-      - name: 构建 CLI
-        run: cargo build --release --locked -p mystery-novel-agent
       - name: 收集产物
         run: |
           mkdir -p dist
           cp target/release/bundle/deb/*.deb dist/mystery-shelf-linux-amd64.deb
           cp target/release/bundle/appimage/*.AppImage dist/mystery-shelf-linux-amd64.AppImage
-          cp target/release/mystery-novel-agent dist/mystery-novel-agent-linux-amd64
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux
@@ -235,7 +230,7 @@ jobs:
 
   # -------------------------------------------------------------- macOS
   build-macos:
-    name: macOS（universal DMG + CLI）
+    name: macOS（universal DMG）
     runs-on: macos-latest # arm64；产物为 universal（同时含 arm64 + x86_64）
     timeout-minutes: 90
     steps:
@@ -262,16 +257,10 @@ jobs:
         working-directory: frontend
       - name: 构建 GUI（universal DMG）
         run: cargo tauri build --target universal-apple-darwin --bundles dmg
-      - name: 构建 CLI（两架构 + lipo 合并为 universal）
-        run: |
-          cargo build --release --locked -p mystery-novel-agent --target aarch64-apple-darwin
-          cargo build --release --locked -p mystery-novel-agent --target x86_64-apple-darwin
-          mkdir -p dist
-          lipo -create -output dist/mystery-novel-agent-macos-universal \
-            target/aarch64-apple-darwin/release/mystery-novel-agent \
-            target/x86_64-apple-darwin/release/mystery-novel-agent
       - name: 收集产物
-        run: cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/mystery-shelf-macos-universal.dmg
+        run: |
+          mkdir -p dist
+          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/mystery-shelf-macos-universal.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos
@@ -337,9 +326,9 @@ jobs:
               --title "Release ${GITHUB_REF_NAME}" \
               --notes "标签 ${GITHUB_REF_NAME} 的自动构建产物：
           - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
-          - Linux：deb / AppImage / CLI
+          - Linux：deb / AppImage
           - Android：universal APK（arm64 + armv7）
-          - macOS：universal DMG / CLI
+          - macOS：universal DMG
           - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）"
           else
             # 滚动 Release（正式版，非预发布）：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
@@ -351,9 +340,9 @@ jobs:
               --notes "main 分支最新构建（每次 push 自动更新）。
 
           - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
-          - Linux：deb / AppImage / CLI
+          - Linux：deb / AppImage
           - Android：universal APK（arm64 + armv7）
-          - macOS：universal DMG / CLI
+          - macOS：universal DMG
           - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）
 
           正式版本见 v* 标签的 Release。"

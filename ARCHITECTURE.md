@@ -36,6 +36,9 @@
 
 **解决什么痛点**：网购 / 网盘 / 论坛收集来的 EPUB 元数据脏乱（书名乱码或繁体、无作者、无简介无封面）；同一本书多版本、系列卷号混乱；想看优质评价要人肉上豆瓣。现成工具（Calibre）全能但整理全靠手动。
 
+> ⚠️ **CLI 已弃用**（源码保留，CI 不再构建分发，新功能只进 GUI）。
+> 下表命令与 §5–§13 的行为描述仍适用于 GUI 复用的同一套核心库（CLI 入口 `ingest_book` 即 GUI `prepare_import` 等的非交互前身）。
+
 | 能力 | CLI 命令 | 说明 |
 | :--- | :--- | :--- |
 | 导入增强 | `add <epub\|目录>` | claspclub 匹配 → 元数据/简介/封面/系列增强 → 拼音命名入书库（目录则批量） |
@@ -488,15 +491,17 @@ model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 
 ### 20.1 CI 自动构建与发布（双远端）
 
-**GitLab**（origin = git.tsinghua.edu.cn，`.gitlab-ci.yml`）—— Linux Docker runner，只构建两类产物（Android/macOS/iOS 移至 GitHub，GitLab 无对应 runner）：
-- `build:linux-cli`：Linux 原生 CLI；`build:windows`：**cargo-xwin 交叉编译**（`cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`）→ NSIS 安装包 + Windows CLI；
+**CLI 已弃用：不随 CI 构建分发**（源码保留，`cargo build --release` 可自行编译）。
+
+**GitLab**（origin = git.tsinghua.edu.cn，`.gitlab-ci.yml`）—— Linux Docker runner，只构建 Windows GUI 安装包（Android/macOS/iOS 移至 GitHub，GitLab 无对应 runner）：
+- `build:windows`：**cargo-xwin 交叉编译**（`cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis`）→ NSIS 安装包；
 - `publish:continuous` / `publish:release`：产物上传 generic package registry（continuous 同名覆盖 / `v*` 标签版本化），并维护**滚动 Release**（tag 固定 `continuous`：每次构建 DELETE 旧 Release 与 tag、再以当前提交经 Releases API 重建；tag 规则限定 `^v/` 防 CI 自建标签循环触发）。
 
 **GitHub**（github remote = Alpha1022/MysteryNovelAgent，`.github/workflows/release.yml`）—— 托管 runner 原生环境五平台矩阵（推送映射 `git push github master:main`）：
-- `build-windows`（windows-latest）：NSIS 安装包 + CLI；
-- `build-linux`（ubuntu-24.04）：webkit2gtk-4.1 依赖 + **deb/AppImage** + CLI（`APPIMAGE_EXTRACT_AND_RUN=1` 免 FUSE）；
+- `build-windows`（windows-latest）：NSIS 安装包；
+- `build-linux`（ubuntu-24.04）：webkit2gtk-4.1 依赖 + **deb/AppImage**（`APPIMAGE_EXTRACT_AND_RUN=1` 免 FUSE）；
 - `build-android`（ubuntu-latest）：runner 自带 Android SDK，补装 SDK 36/NDK 26 + JDK 17，`cargo tauri android build --apk --target aarch64 --target armv7` → 通用 APK；**签名**：gen/android 的 gradle 读环境变量 `KEYSTORE_FILE/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD`，CI 从 Secrets `KEYSTORE_BASE64`（解码为文件）等四项注入 —— 构建前 keytool 预检口令与别名（快速失败，不等全量编译后签名才炸），缺 Secrets 时明确报错；
-- `build-macos`（macos-latest，arm64）：`--target universal-apple-darwin` DMG（tauri 双架构 lipo 合并）+ CLI（手动 lipo 为 universal）；
+- `build-macos`（macos-latest，arm64）：`--target universal-apple-darwin` DMG（tauri 双架构 lipo 合并）；
 - `build-ios`（macos-latest）：**Rust 编译检查**（`cargo build --target aarch64-apple-ios,aarch64-apple-ios-sim -p mystery-gui`，无产物）—— tauri 生成的 Xcode 工程的 Build Rust Code 阶段必须由 `tauri ios build/dev` 的服务进程编排（经临时目录 `{identifier}-server-addr` 文件通信），绕过 CLI 直接 `xcodebuild` 会在 read_options 处 panic；`ios build` 又面向真机且需签名（CLI 不支持模拟器目标）——故退化为编译验证（真机分发需 Apple 开发者证书经 Xcode 归档签名）；
 - `publish`：download-artifact 汇总（merge-multiple）→ `gh release create -R $GITHUB_REPOSITORY`：main push → 滚动 Release `continuous`（正式版非预发布；`--cleanup-tag` 删旧重建、`--target $GITHUB_SHA`；gh 不经本地 git 解析仓库故必须 -R —— publish 无 checkout）；`v*` 标签 → 正式 Release（需单独 `git push github v0.1.0`）；
 - 共性：tauri-cli 走 taiki-e/install-action 预编译（失败回退源码）、swatinem/rust-cache 缓存 Rust、setup-node 缓存 npm、并发去重（cancel-in-progress）；**gen/android 入库**（Manifest 权限/Kotlin 插件/签名配置，`gradlew` 在 git index 标记 755 —— Windows 提交默认丢执行位）。私有仓库注意 macOS runner 按 10 倍计费分钟数。
