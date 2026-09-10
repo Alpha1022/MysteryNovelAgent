@@ -480,7 +480,8 @@ model = "deepseek-chat"; input_per_m = 2.0; output_per_m = 8.0
 - **CLI**：仓库根 `cargo build` / `cargo test`；WSL 环境 `wsl -d Ubuntu -e bash -lc "cd ~/mystery-novel-agent && cargo ..."`。
 - **GUI 开发**：`npm run tauri dev`（自动起 vite dev server + cargo）。
 - **GUI 出包**：`npm run tauri build`。
-- ⚠️ **裸 `cargo build` 出的 debug 二进制加载 devUrl**（需要 5173 端口 dev server 在跑），**不嵌入前端** —— 必须经 tauri CLI 构建；release 才把 frontendDist 打进二进制。
+- ⚠️ **裸 `cargo build` 出的 debug 二进制加载 devUrl**（需要 5173 端口 dev server 在跑），**不嵌入前端** —— 必须经 tauri CLI 构建（CLI 内部以 `--features tauri/custom-protocol` 构建：该特性使 `generate_context!` 改为内嵌 frontendDist 并忽略 devUrl）；如需不经 CLI 的独立构建：`cargo build --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol`。
+- **开发模式自检**（`check_dev_server`，`#[cfg(all(dev, desktop))]`）：dev 构建且 devUrl TCP 探测不可达时，启动即弹原生错误弹窗给出三条出路（tauri dev / 独立构建加特性 / tauri build）并退出 —— 替代原来的"白屏打不开"；`tauri dev` 场景 CLI 先等 dev server 就绪再拉起应用，探测正常通过不误弹。
 - **前端改动与嵌入**：dist 资产经 `generate_context!` 宏嵌入，修改前端后要经 tauri CLI 重新构建；怀疑嵌入过期时 `cargo clean -p mystery-gui` 强制重编译。
 - **Android**：见 §15。
 - **诊断**：GUI 的 Rust 侧 `tracing` 日志 → `app.log`；前端可 `invoke('debug_log', {msg})` 转发；`RUST_LOG` 覆盖级别。

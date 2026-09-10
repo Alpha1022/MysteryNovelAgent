@@ -43,11 +43,17 @@
 # 开发调试（桌面）：自动拉起 vite 与应用窗口
 cargo tauri dev
 
-# 或手动分别构建
+# 独立构建（不经 tauri CLI）：必须启用 custom-protocol 特性才会内嵌前端，
+# 否则产物运行时依赖 vite dev server，直接运行会是白屏
 cd frontend && npm install && npm run build && cd ..
-cargo build --workspace
+cargo build --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol
 # 运行 target/debug/mystery-gui.exe
 ```
+
+> ⚠️ **不要**用裸 `cargo build` / `cargo build --workspace` 后直接运行
+> `target/debug/mystery-gui.exe` —— 那是开发模式产物（前端走 devUrl 的
+> vite dev server，未内嵌），dev server 没在跑就是白屏；启动时的报错弹窗
+> 也会给出同样的指引。开发用 `cargo tauri dev`，出包用 `cargo tauri build`。
 
 首次启动会引导**创建书库**（选择本地目录）。
 
@@ -167,8 +173,13 @@ cargo run -- --help             # 验证 CLI 结构
 
 ## 调试
 
+- **debug 版 mystery-gui.exe 打开是白屏/报错弹窗**：裸 `cargo build` 的产物
+  未内嵌前端（运行时加载 devUrl）——用 `cargo tauri dev` 开发、
+  `cargo tauri build` 出包，或独立构建时加
+  `--features tauri/custom-protocol`（见[使用方法](#gui推荐)）。
 - **日志**：`tracing` 全局日志，`RUST_LOG=debug cargo tauri dev` 提升级别；
-  WebDav 同步、导入降级链的关键节点均有 info/warn 日志。
+  WebDav 同步、导入降级链的关键节点均有 info/warn 日志；
+  GUI 日志同时写入数据目录 `app.log`（release 下 stdout 不可见时用于事后诊断）。
 - **桌面 DevTools**：debug 构建下右键 → 检查（Inspect），Network 页可看到全部 `invoke` IPC 调用。
 - **Android**：`adb logcat -s tauri` 查看原生日志；debug 构建可在 chrome://inspect 调试 WebView。
 - **同步排查**：

@@ -6,6 +6,55 @@ use tauri::Manager;
 mod commands;
 mod storage_permission;
 
+/// 开发模式自检：裸 `cargo build`（未启用 `tauri/custom-protocol` 特性）的产物
+/// 不内嵌前端、运行时加载 devUrl 的 vite dev server —— 探测不可达时给出
+/// 明确指引，避免用户拿到一个"白屏打不开"的窗口。
+///
+/// `cargo tauri dev` 场景下 CLI 会先等 dev server 就绪再拉起应用，
+/// 此探测正常通过，不会误弹。
+#[cfg(all(dev, desktop))]
+fn check_dev_server(app: &tauri::AppHandle) {
+  use std::net::{TcpStream, ToSocketAddrs};
+  use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+  let Some(url) = app.config().build.dev_url.clone() else {
+    return;
+  };
+  let Some((host, port)) = url.host_str().zip(url.port()) else {
+    return;
+  };
+  let reachable = (host, port)
+    .to_socket_addrs()
+    .map(|mut addrs| {
+      addrs.any(|addr| {
+        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).is_ok()
+      })
+    })
+    .unwrap_or(false);
+  if reachable {
+    return;
+  }
+
+  tracing::warn!(
+    "开发模式构建未内嵌前端（依赖 devUrl），且 devUrl {url} 不可达 —— 弹窗指引后退出"
+  );
+  let handle = app.clone();
+  app
+    .dialog()
+    .message(format!(
+      "当前是开发模式构建：未内嵌前端，运行时需要前端开发服务器（{url}），但无法连接。\n\n\
+       请改用以下任一方式：\n\
+       1. 开发调试：cargo tauri dev（自动拉起前端与窗口）\n\
+       2. 独立构建：cargo build --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol\n\
+       3. 发布安装包：cargo tauri build"
+    ))
+    .title("无法连接前端开发服务器")
+    .kind(MessageDialogKind::Error)
+    .show(move |_| {
+      handle.exit(1);
+    });
+}
+
 /// 日志初始化：默认 info（RUST_LOG 覆盖），stdout 与数据目录 app.log 双写
 ///
 /// GUI 在 Windows 子系统（release）下 stdout 不可见，日志落文件便于事后诊断
@@ -87,6 +136,10 @@ pub fn run() {
       app.manage(commands::TaskRegistry::default());
       app.manage(commands::SyncTaskRegistry::default());
       app.manage(commands::ImportCache::default());
+
+      // Windows 拖拽修复等已移除；开发模式自检（详见函数注释）
+      #[cfg(all(dev, desktop))]
+      check_dev_server(app.handle());
 
       Ok(())
     })
