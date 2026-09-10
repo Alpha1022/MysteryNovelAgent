@@ -63,6 +63,17 @@ const VIEW_KEY = "library.view";
 const SIZE_KEY = "library.coverSize";
 /** 书架滚动位置（localStorage：跨会话保持，返回页面或重启应用后恢复） */
 const SCROLL_KEY = "library.scrollY";
+/** 书架搜索词（localStorage：与滚动位置同寿命，恢复时首屏即带过滤条件） */
+const SEARCH_KEY = "library.search";
+
+/** 读取持久化的搜索词（无 / 存储异常 → 空串） */
+function loadSearch(): string {
+  try {
+    return localStorage.getItem(SEARCH_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 function loadView(): ViewMode {
   const v = localStorage.getItem(VIEW_KEY);
@@ -225,8 +236,10 @@ export default function LibraryPage() {
   const syncTaskIdRef = useRef<string>("");
   /** 书库目录不可写（Android 存储权限缺失）→ 显示授权引导 */
   const [permPrompt, setPermPrompt] = useState(false);
-  const [query, setQuery] = useState("");
-  const [debounced, setDebounced] = useState("");
+  // 搜索词与防抖值均从持久化恢复（同一存储键）：首屏 getBooks 即带过滤，
+  // 避免"先全量列表再二次过滤"的双请求闪烁；与滚动位置同寿命、同一视图状态
+  const [query, setQuery] = useState(loadSearch);
+  const [debounced, setDebounced] = useState(() => loadSearch().trim());
 
   // 加书流程状态
   const [refresh, setRefresh] = useState(0);
@@ -408,7 +421,11 @@ export default function LibraryPage() {
     }
   };
 
-  // 搜索防抖 300ms
+  // 搜索词持久化（每次变更即存，防抖清理不会丢最后一次输入）；
+  // 搜索防抖 300ms（query 与 debounced 同键恢复，仅用户输入产生差异）
+  useEffect(() => {
+    localStorage.setItem(SEARCH_KEY, query);
+  }, [query]);
   useEffect(() => {
     const t = setTimeout(() => setDebounced(query.trim()), 300);
     return () => clearTimeout(t);
