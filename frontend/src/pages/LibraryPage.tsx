@@ -16,6 +16,7 @@ import {
   webdavPull,
   webdavPush,
 } from "../api/tauri";
+import type { CoverRecoverReport } from "../api/tauri";
 import type { BookCard, EpubPreview, ImportResult, TaskProgressEvent } from "../types";
 import { getConfig } from "../api/tauri";
 import { pickDirectory, pickEpub } from "../api/picker";
@@ -357,6 +358,20 @@ export default function LibraryPage() {
     const h = () => setRefresh((k) => k + 1);
     window.addEventListener("mna:library-refresh", h);
     return () => window.removeEventListener("mna:library-refresh", h);
+  }, []);
+
+  // 启动后台封面自动恢复完成（covers-recovered 事件）：有恢复则刷新书架并提示
+  useEffect(() => {
+    const un = listen<CoverRecoverReport>("covers-recovered", (e) => {
+      const r = e.payload;
+      if (r && r.recovered > 0) {
+        setRefresh((k) => k + 1);
+        setNotice(`已自动恢复 ${r.recovered} 个缺失封面` + (r.failed > 0 ? `（${r.failed} 个未能恢复，详见日志）` : ""));
+      }
+    });
+    return () => {
+      un.then((fn) => fn()).catch(() => undefined);
+    };
   }, []);
 
   // 返回顶部 / 回原位浮动按钮：不在顶部时显示（↑）；

@@ -1630,6 +1630,14 @@ a {
   background: var(--panel-2);
 }
 
+/* 书库页签工具行（封面恢复等全局书库操作） */
+.lib-tools-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
 .lib-card.current {
   border-color: rgba(201, 168, 106, 0.5);
 }

@@ -816,6 +816,11 @@ pub fn update_book_cover(
     "UPDATE books SET cover_path = ?1 WHERE id = ?2",
     rusqlite::params![cover_path, book_id],
   )?;
+  // 路径未变（如封面恢复重建了同一内容寻址文件）：引用关系不变，
+  // 不加不减 —— 无条件 add 会造成引用计数虚增（计数归零判断失真）
+  if old.as_deref() == Some(cover_path) {
+    return Ok(None);
+  }
   cover_ref_add(conn, cover_path)?;
   if let Some(old_path) = old.as_deref() {
     if old_path != cover_path && cover_ref_release(conn, old_path)? {
@@ -1685,6 +1690,25 @@ mod tests {
     let conn = test_conn();
     let id = insert_book(&conn, "白夜行", "东野圭吾", "推理小说", "E:\\b.epub", "[]").unwrap();
     let p = "C:\\covers\\a.jpg";
+
+    // update_book_cover：old == new（封面恢复重建同一内容寻址文件）→
+    // 引用计数不增不减（无条件 add 会虚增计数）
+    conn
+      .execute("UPDATE books SET cover_path = ?1 WHERE id = ?2", rusqlite::params![p, id])
+      .unwrap();
+    cover_ref_add(&conn, p).unwrap();
+    update_book_cover(&conn, id, p).unwrap();
+    let refs: i64 = conn
+      .query_row("SELECT refs FROM cover_refs WHERE path = ?1", rusqlite::params![p], |r| {
+        r.get(0)
+      })
+      .unwrap();
+    assert_eq!(refs, 1, "同路径重复 update 不应虚增引用计数");
+
+    // 换新封面：新路径 +1、旧路径 -1（归零返回待删除）
+    let p_new = "C:\\covers\\b.jpg";
+    let orphaned = update_book_cover(&conn, id, p_new).unwrap();
+    assert_eq!(orphaned.as_deref(), Some(p));
 
     // 两个引用（如：两个来源共用同一封面文件）
     cover_ref_add(&conn, p).unwrap();

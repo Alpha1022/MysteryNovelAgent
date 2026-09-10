@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tracing::{info, warn};
 
 use mystery_novel_agent::config::AppConfig;
@@ -3660,6 +3660,138 @@ pub fn reset_llm_usage(
 ) -> Result<(), String> {
   let conn = state.lock().map_err(|e| e.to_string())?;
   db::reset_llm_usage(&conn).map_err(|e| e.to_string())
+}
+
+// ============================= //
+//  封面缺失自动恢复
+// ============================= //
+
+/// 封面恢复结果（命令返回 / 启动后台任务的完成事件负载）
+#[derive(Serialize, Clone)]
+pub struct CoverRecoverDto {
+  /// 扫描书籍总数
+  pub scanned: usize,
+  /// 封面缺失数
+  pub missing: usize,
+  /// 成功恢复数
+  pub recovered: usize,
+  /// 恢复失败数（所有候选来源均未命中）
+  pub failed: usize,
+  /// 明细（书名 → 恢复来源），失败条目含原因
+  pub details: Vec<String>,
+}
+
+/// 封面恢复编排：扫描（持锁）→ 逐本恢复（网络不持锁）→ 落库（持锁）。
+/// 命令触发与启动自动恢复共用；progress 供手动触发时的进度展示。
+async fn run_cover_recovery(
+  state: &State<'_, Mutex<rusqlite::Connection>>,
+  progress: &(dyn Fn(ingestion::TaskProgress) + Send + Sync),
+) -> Result<CoverRecoverDto, String> {
+  // 阶段一：扫描（纯读取，短暂持锁）
+  let (missing, scanned) = {
+    let conn = state.lock().map_err(|e| e.to_string())?;
+    let scanned = db::get_all_books(&conn)
+      .map(|b| b.len())
+      .map_err(|e| e.to_string())?;
+    (ingestion::find_missing_covers(&conn), scanned)
+  };
+  let mut dto = CoverRecoverDto {
+    scanned,
+    missing: missing.len(),
+    recovered: 0,
+    failed: 0,
+    details: Vec::new(),
+  };
+  if missing.is_empty() {
+    info!("封面扫描：{scanned} 本书全部正常，无需恢复");
+    return Ok(dto);
+  }
+  warn!("封面扫描：{scanned} 本书中 {} 本封面缺失，开始恢复", missing.len());
+
+  let cfg = AppConfig::load();
+  let covers_dir = cfg.covers_dir().map_err(|e| format!("封面缓存目录不可用: {e}"))?;
+  let client = ingestion::gui_http_client();
+
+  // 阶段二 + 三：逐本恢复（网络/文件 IO 不持锁；落库短暂持锁）
+  for (i, m) in missing.iter().enumerate() {
+    progress(ingestion::TaskProgress {
+      phase: "cover-recover".into(),
+      current: i as i64 + 1,
+      total: missing.len() as i64,
+      message: format!("恢复封面 {}/{}：{}", i + 1, missing.len(), m.title),
+    });
+    match ingestion::try_recover_cover(m, &client).await {
+      Some((bytes, ext)) => {
+        // 落盘（内容去重）+ 落库（新封面登记引用、旧路径释放）
+        let dest = ingestion::save_cover_dedup(&covers_dir, &bytes, &ext)
+          .map_err(|e| format!("封面写入失败: {e}"))?;
+        let new_path = dest.to_string_lossy().into_owned();
+        let res = {
+          let conn = state.lock().map_err(|e| e.to_string())?;
+          db::update_book_cover(&conn, m.book_id, &new_path)
+        };
+        match res {
+          Ok(orphan) => {
+            // 旧封面引用归零时删除残留文件（含此前悬空的路径）
+            if let Some(old) = orphan.as_deref().or(m.old_path.as_deref()) {
+              if old != new_path {
+                let conn = state.lock().map_err(|e| e.to_string())?;
+                release_cover_file(&conn, old, &covers_dir);
+              }
+            }
+            dto.recovered += 1;
+            dto.details.push(format!("《{}》已恢复", m.title));
+            info!("封面恢复成功：《{}》→ {}", m.title, new_path);
+          }
+          Err(e) => {
+            dto.failed += 1;
+            dto.details.push(format!("《{}》落库失败：{e}", m.title));
+          }
+        }
+      }
+      None => {
+        dto.failed += 1;
+        dto.details
+          .push(format!("《{}》恢复失败（无可用来源：本地缓存/EPUB 内嵌/远程均未命中）", m.title));
+        warn!("封面恢复失败：《{}》（book_id={}）", m.title, m.book_id);
+      }
+    }
+  }
+  Ok(dto)
+}
+
+/// 手动触发封面恢复（设置页按钮；进度经 task-progress 事件实时推送）
+#[tauri::command]
+pub async fn recover_covers(
+  state: State<'_, Mutex<rusqlite::Connection>>,
+  app: tauri::AppHandle,
+) -> Result<CoverRecoverDto, String> {
+  let emitter = app.clone();
+  let progress = move |p: ingestion::TaskProgress| {
+    let _ = emitter.emit("task-progress", &p);
+  };
+  let dto = run_cover_recovery(&state, &progress).await?;
+  Ok(dto)
+}
+
+/// 启动后台自动恢复（lib.rs 调用）：扫描 → 恢复 → 广播 covers-recovered 事件。
+/// 恢复数为 0 时也广播（前端据此确认无缺失）；延迟 8s 启动，避开应用初始化与书架首屏加载。
+pub async fn startup_cover_recovery(app: tauri::AppHandle) {
+  tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+  let state = app.state::<Mutex<rusqlite::Connection>>();
+  let noop = |_p: ingestion::TaskProgress| {};
+  match run_cover_recovery(&state, &noop).await {
+    Ok(dto) => {
+      if dto.missing > 0 {
+        info!(
+          "启动封面恢复完成：缺失 {}，恢复 {}，失败 {}",
+          dto.missing, dto.recovered, dto.failed
+        );
+      }
+      let _ = app.emit("covers-recovered", &dto);
+    }
+    Err(e) => warn!("启动封面恢复失败: {e}"),
+  }
 }
 
 // ============================= //

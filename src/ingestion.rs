@@ -2472,6 +2472,236 @@ pub fn persist_import(conn: &rusqlite::Connection, p: &PreparedImport) -> rusqli
 }
 
 // ------------------------------------------------------------------ //
+//  封面缺失自动恢复
+// ------------------------------------------------------------------ //
+
+/// 封面恢复的候选来源（按成本从低到高排列，恢复时依次尝试）
+#[derive(Debug, Clone, Default)]
+pub struct CoverCandidates {
+  /// 同书来源项目已缓存的本地封面文件（内容寻址，直接引用零成本）
+  pub source_local: Vec<PathBuf>,
+  /// 可提取内嵌封面的 EPUB 路径（书库副本优先、原始文件兜底）
+  pub epub_paths: Vec<PathBuf>,
+  /// 来源项目的远程封面直链（OSS，带 Referer 伪装下载）
+  pub source_urls: Vec<String>,
+  /// 豆瓣书籍页链接（解析 og:image 兜底）
+  pub douban_urls: Vec<String>,
+  /// clasp 条目 ID（详情 API 拉封面直链）
+  pub clasp_ids: Vec<String>,
+}
+
+/// 一本封面缺失的书（扫描阶段产出，恢复阶段不再依赖数据库）
+#[derive(Debug, Clone)]
+pub struct MissingCover {
+  pub book_id: i64,
+  pub title: String,
+  /// 原封面路径（缺失/为空；恢复后用于引用计数释放）
+  pub old_path: Option<String>,
+  pub candidates: CoverCandidates,
+}
+
+/// 判断封面是否缺失：未设置 / 文件不存在 / 空文件
+fn cover_is_missing(cover_path: Option<&str>) -> bool {
+  match cover_path.map(str::trim).filter(|s| !s.is_empty()) {
+    None => true,
+    Some(p) => match std::fs::metadata(p) {
+      Ok(m) => m.len() == 0,
+      Err(_) => true,
+    },
+  }
+}
+
+/// 解析书籍 EPUB 路径候选（书库副本优先、原始文件兜底）。
+/// 目录优先级与 open_book_file 一致：书籍归属书库 → 当前书库 → 遗留单书库字段。
+fn book_epub_candidates(
+  cfg: &crate::config::AppConfig,
+  library_file: &str,
+  file_path: &str,
+  book_library_id: Option<&str>,
+) -> Vec<PathBuf> {
+  let lib_dir = cfg
+    .libraries
+    .iter()
+    .find(|l| Some(l.id.as_str()) == book_library_id)
+    .or_else(|| {
+      cfg
+        .libraries
+        .iter()
+        .find(|l| Some(l.id.as_str()) == cfg.current_library.as_deref())
+    })
+    .map(|l| l.path.clone())
+    .or_else(|| cfg.library_path.clone());
+  let mut out = Vec::new();
+  if let Some(dir) = lib_dir {
+    let f = library_file.trim();
+    if !f.is_empty() {
+      out.push(dir.join(f));
+    }
+  }
+  if !file_path.trim().is_empty() {
+    out.push(PathBuf::from(file_path));
+  }
+  out.into_iter().filter(|p| p.is_file()).collect()
+}
+
+/// 解析 JSON 字符串数组字段（clasp_ids / douban_urls）
+fn parse_json_str_list(raw: Option<&str>) -> Vec<String> {
+  raw
+    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+    .unwrap_or_default()
+}
+
+/// 扫描数据库，收集封面缺失的书籍及其恢复候选（纯读取，短暂持锁即可）
+///
+/// 候选按成本排序：同书来源本地缓存 → EPUB 内嵌（副本→原始）→
+/// 来源远程直链 → 豆瓣页面 → clasp 详情。
+pub fn find_missing_covers(conn: &rusqlite::Connection) -> Vec<MissingCover> {
+  let cfg = crate::config::AppConfig::load();
+  let mut out = Vec::new();
+  let rows = conn.prepare(
+    "SELECT b.id, b.title, b.cover_path, b.library_file, b.file_path, b.library_id,
+            b.clasp_ids, b.douban_urls
+     FROM books b",
+  );
+  let Ok(mut stmt) = rows else {
+    warn!("封面扫描：查询书籍失败");
+    return out;
+  };
+  let mapped = stmt.query_map([], |row| {
+    Ok((
+      row.get::<_, i64>(0)?,
+      row.get::<_, String>(1)?,
+      row.get::<_, Option<String>>(2)?,
+      row.get::<_, Option<String>>(3)?,
+      row.get::<_, Option<String>>(4)?,
+      row.get::<_, Option<String>>(5)?,
+      row.get::<_, Option<String>>(6)?,
+      row.get::<_, Option<String>>(7)?,
+    ))
+  });
+  let Ok(mapped) = mapped else {
+    warn!("封面扫描：查询书籍失败");
+    return out;
+  };
+  let mut parsed = Vec::new();
+  for r in mapped.flatten() {
+    parsed.push(r);
+  }
+
+  for (id, title, cover_path, library_file, file_path, library_id, clasp_ids, douban_urls) in
+    parsed
+  {
+    if !cover_is_missing(cover_path.as_deref()) {
+      continue;
+    }
+    // 来源候选（clasp 在前、豆瓣在后，与导入时一致）
+    let mut source_local = Vec::new();
+    let mut source_urls = Vec::new();
+    if let Ok(srcs) = db::list_sources(conn, id) {
+      for s in &srcs {
+        if let Some(p) = s.cover_path.as_deref().filter(|p| Path::new(p).is_file()) {
+          if !source_local.iter().any(|x: &PathBuf| x == p) {
+            source_local.push(PathBuf::from(p));
+          }
+        }
+        if let Some(u) = s.cover_url.as_deref().filter(|u| !u.trim().is_empty()) {
+          if !source_urls.iter().any(|x| x == u) {
+            source_urls.push(u.to_string());
+          }
+        }
+      }
+    }
+    let epub_paths = book_epub_candidates(
+      &cfg,
+      library_file.as_deref().unwrap_or(""),
+      file_path.as_deref().unwrap_or(""),
+      library_id.as_deref(),
+    );
+    out.push(MissingCover {
+      book_id: id,
+      title,
+      old_path: cover_path.filter(|p| !p.trim().is_empty()),
+      candidates: CoverCandidates {
+        source_local,
+        epub_paths,
+        source_urls,
+        douban_urls: parse_json_str_list(douban_urls.as_deref()),
+        clasp_ids: parse_json_str_list(clasp_ids.as_deref())
+          .into_iter()
+          .filter(|s| !s.trim().is_empty())
+          .collect(),
+      },
+    });
+  }
+  out
+}
+
+/// 尝试恢复一本书的封面（不碰数据库；返回字节与扩展名）。
+/// 依次尝试候选来源，任一成功即止 —— 本地优先，网络兜底。
+pub async fn try_recover_cover(
+  m: &MissingCover,
+  client: &reqwest::Client,
+) -> Option<(Vec<u8>, String)> {
+  let c = &m.candidates;
+  // 1) 同书来源的本地缓存（直接读文件）
+  for p in &c.source_local {
+    if let Ok(bytes) = std::fs::read(p) {
+      if !bytes.is_empty() {
+        let ext = p
+          .extension()
+          .and_then(|e| e.to_str())
+          .map(|e| e.to_lowercase())
+          .unwrap_or_else(|| "jpg".into());
+        info!("封面恢复[{}]：复用来源本地缓存 {}", m.book_id, p.display());
+        return Some((bytes, ext));
+      }
+    }
+  }
+  // 2) EPUB 内嵌封面（书库副本 → 原始文件）
+  for p in &c.epub_paths {
+    if let Some((bytes, ext)) = extract_epub_cover_bytes(p) {
+      info!("封面恢复[{}]：提取 EPUB 内嵌封面 {}", m.book_id, p.display());
+      return Some((bytes, ext));
+    }
+  }
+  // 3) 来源远程直链（OSS，fetch_remote_image 自带 Referer 伪装）
+  for u in &c.source_urls {
+    if let Ok(bytes) = fetch_remote_image(u).await {
+      if bytes.len() > 1024 {
+        let ext = if u.to_lowercase().contains(".png") { "png" } else { "jpg" };
+        info!("封面恢复[{}]：下载来源封面 {u}", m.book_id);
+        return Some((bytes, ext.into()));
+      }
+    }
+  }
+  // 4) 豆瓣书籍页 og:image（含随机 bid 与 UA 伪装）
+  for u in &c.douban_urls {
+    if let Ok(Some(img)) = fetch_douban_cover(client, u).await {
+      if let Ok(bytes) = fetch_remote_image(&img).await {
+        if bytes.len() > 1024 {
+          info!("封面恢复[{}]：豆瓣 og:image {img}", m.book_id);
+          return Some((bytes, "jpg".into()));
+        }
+      }
+    }
+  }
+  // 5) claspclub 详情 → 封面直链
+  for id in &c.clasp_ids {
+    if let Ok(detail) = spider::fetch_book_detail(client, id).await {
+      if let Some(u) = detail.cover_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Ok(bytes) = fetch_remote_image(u).await {
+          if bytes.len() > 1024 {
+            info!("封面恢复[{}]：clasp 详情封面 {u}", m.book_id);
+            return Some((bytes, "jpg".into()));
+          }
+        }
+      }
+    }
+  }
+  None
+}
+
+// ------------------------------------------------------------------ //
 //  辅助
 // ------------------------------------------------------------------ //
 
@@ -2872,4 +3102,127 @@ mod tests {
     assert_eq!(edition_label(&e2), "新星出版社");
   }
 
+  /// 封面缺失扫描：NULL / 文件不存在 / 空文件 → 缺失；候选来源齐备
+  #[test]
+  fn test_find_missing_covers() {
+    let dir = std::env::temp_dir().join(format!("mna-covrec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = crate::db::open_db(":memory:").unwrap();
+
+    // 一本内嵌封面的 EPUB（书库副本）
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    let epub = lib.join("zhong-biao-guan.epub");
+    rbook::Epub::builder()
+      .identifier("urn:covrec")
+      .title("书")
+      .author("人")
+      .language("zh")
+      .cover_image(("cover.png", b"fake png bytes".to_vec()))
+      .write()
+      .save(&epub)
+      .unwrap();
+
+    // a：无封面；b：指向不存在文件；c：指向空文件；d：正常（EPUB 副本 + 来源缓存）
+    let a = db::insert_book(&conn, "无封面", "甲", "推理小说", "", "[]").unwrap();
+    let b = db::insert_book(&conn, "路径悬空", "乙", "推理小说", "", "[]").unwrap();
+    conn.execute(
+      "UPDATE books SET cover_path = ?1 WHERE id = ?2",
+      rusqlite::params![dir.join("gone.png").to_string_lossy(), b],
+    )
+    .unwrap();
+    let c = db::insert_book(&conn, "空文件", "丙", "推理小说", "", "[]").unwrap();
+    let empty = dir.join("empty.png");
+    std::fs::write(&empty, b"").unwrap();
+    conn.execute(
+      "UPDATE books SET cover_path = ?1 WHERE id = ?2",
+      rusqlite::params![empty.to_string_lossy(), c],
+    )
+    .unwrap();
+    let d = db::insert_book(&conn, "正常", "丁", "推理小说", "", "[]").unwrap();
+    let ok_cover = dir.join("ok.png");
+    std::fs::write(&ok_cover, b"real bytes").unwrap();
+    conn.execute(
+      "UPDATE books SET cover_path = ?1, library_file = ?2 WHERE id = ?3",
+      rusqlite::params![ok_cover.to_string_lossy(), "zhong-biao-guan.epub", d],
+    )
+    .unwrap();
+    let _ = db::insert_source(
+      &conn, d, "clasp", "clsp-1", 0, Some("来源书名"), None, None, None, None, None, None, None, None,
+    );
+
+    let missing = find_missing_covers(&conn);
+    let ids: Vec<i64> = missing.iter().map(|m| m.book_id).collect();
+    assert_eq!(ids, vec![a, b, c], "只有 a/b/c 缺失: {ids:?}");
+    // d 不在缺失列表（文件存在且非空）
+    assert!(!ids.contains(&d));
+
+    // 候选：d 若缺失应有 EPUB 候选（书库副本）；a/b/c 无任何来源与 EPUB → 候选为空
+    let m_a = &missing[0];
+    assert!(m_a.candidates.source_local.is_empty());
+    assert!(m_a.candidates.epub_paths.is_empty());
+    assert!(m_a.old_path.is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
+
+  /// 封面恢复（本地路径）：EPUB 内嵌封面提取成功；来源本地缓存优先级最高
+  #[tokio::test]
+  async fn test_try_recover_cover_local() {
+    let dir = std::env::temp_dir().join(format!("mna-covrec2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let epub = dir.join("book.epub");
+    rbook::Epub::builder()
+      .identifier("urn:covrec2")
+      .title("书")
+      .author("人")
+      .language("zh")
+      .cover_image(("cover.jpg", b"fake jpg bytes".to_vec()))
+      .write()
+      .save(&epub)
+      .unwrap();
+
+    let client = gui_http_client();
+    // 仅 EPUB 候选 → 提取内嵌封面
+    let m = MissingCover {
+      book_id: 1,
+      title: "t".into(),
+      old_path: None,
+      candidates: CoverCandidates {
+        epub_paths: vec![epub.clone()],
+        ..Default::default()
+      },
+    };
+    let (bytes, ext) = try_recover_cover(&m, &client).await.expect("应从 EPUB 恢复");
+    assert_eq!(bytes, b"fake jpg bytes");
+    assert_eq!(ext, "jpg");
+
+    // 来源本地缓存优先于 EPUB（内容不同以区分来源）
+    let cached = dir.join("cached.png");
+    std::fs::write(&cached, b"from source cache").unwrap();
+    let m2 = MissingCover {
+      book_id: 1,
+      title: "t".into(),
+      old_path: None,
+      candidates: CoverCandidates {
+        source_local: vec![cached],
+        epub_paths: vec![epub],
+        ..Default::default()
+      },
+    };
+    let (bytes2, ext2) = try_recover_cover(&m2, &client).await.expect("应恢复");
+    assert_eq!(bytes2, b"from source cache", "本地缓存优先");
+    assert_eq!(ext2, "png");
+
+    // 无任何候选 → None（不 panic）
+    let m3 = MissingCover {
+      book_id: 2,
+      title: "t".into(),
+      old_path: None,
+      candidates: CoverCandidates::default(),
+    };
+    assert!(try_recover_cover(&m3, &client).await.is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+  }
 }

@@ -257,6 +257,20 @@ export function resetLlmUsage(): Promise<void> {
   return invoke("reset_llm_usage");
 }
 
+/** 封面恢复结果（命令返回 / 启动自动恢复事件负载） */
+export interface CoverRecoverReport {
+  scanned: number;
+  missing: number;
+  recovered: number;
+  failed: number;
+  details: string[];
+}
+
+/** 手动触发封面缺失恢复（进度经 task-progress 事件推送） */
+export function recoverCovers(): Promise<CoverRecoverReport> {
+  return invoke("recover_covers");
+}
+
 /** LLM 可用性预检（加书弹窗合并简介提示用） */
 export function llmStatus(): Promise<LlmStatus> {
   return invoke("llm_status");

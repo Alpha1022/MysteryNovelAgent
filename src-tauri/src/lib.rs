@@ -137,9 +137,17 @@ pub fn run() {
       app.manage(commands::SyncTaskRegistry::default());
       app.manage(commands::ImportCache::default());
 
-      // Windows 拖拽修复等已移除；开发模式自检（详见函数注释）
+      // 开发模式自检（详见函数注释）
       #[cfg(all(dev, desktop))]
       check_dev_server(app.handle());
+
+      // 后台封面缺失自动恢复（延迟 8s 启动避开首屏；完成后广播 covers-recovered）
+      {
+        let handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+          commands::startup_cover_recovery(handle).await;
+        });
+      }
 
       Ok(())
     })
@@ -189,6 +197,7 @@ pub fn run() {
       commands::get_settings,
       commands::save_settings,
       commands::reset_llm_usage,
+      commands::recover_covers,
       commands::llm_status,
       commands::cancel_task,
       commands::cancel_sync_task,

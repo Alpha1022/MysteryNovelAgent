@@ -143,7 +143,7 @@ embeddings (id, book_id, chunk_text, vector BLOB);  -- 预留 RAG，未使用
 **关键机制**：
 
 - **迁移**：启动时幂等 `ALTER TABLE ADD COLUMN`（列已存在静默忽略），无版本号表 —— 老库零迁移成本直接升级；`assign_legacy_books` 把无书库归属的旧数据归入当前书库。
-- **封面引用计数**：同一张封面字节内容只落盘一次（64 位内容哈希 + 长度命名）；书籍/来源/悬停副本各记一引用；删除书籍时 `cover_ref_release`，**归零才允许删文件** —— 修复"两本书共用同一封面、删一本把另一本的封面也删了"。
+- **封面引用计数**：同一张封面字节内容只落盘一次（64 位内容哈希 + 长度命名）；书籍/来源/悬停副本各记一引用；删除书籍时 `cover_ref_release`，**归零才允许删文件** —— 修复"两本书共用同一封面、删一本把另一本的封面也删了"。`update_book_cover` 在新旧路径相同（封面恢复重建同一内容寻址文件）时不增不减，防止计数虚增；启动时 `seed_cover_refs` 重算全部引用（自愈）并清扫无主文件。**封面缺失自愈**：启动后台任务（`find_missing_covers` 扫描 + `try_recover_cover` 按成本依次恢复：来源本地缓存 → EPUB 内嵌 → 远程来源，进度入日志、结果广播 `covers-recovered` 事件），设置页书库页签亦可手动触发。
 - **`library_file` vs `file_path`**：一切消费方（设备同步、合并、阅读器、WebDav）一律用前者；后者仅溯源展示。
 - **`sync_book_source_columns`**：sources 表插入/删除后回写 books 的冗余列（标题/作者/封面等），保证书架列表查询不用 JOIN。
 
@@ -324,6 +324,7 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 | `update_book_meta` | 详情页编辑书名/作者/标签/简介，同步 EPUB 副本 | EPUB 写入失败仅降级更新 DB |
 | `upload_cover` | 手动封面替换：复制入 covers → 同步 EPUB 副本嵌入封面 → 更新 DB（`read_image_file` 供前端裁剪预览读取原图字节） | EPUB 写入失败仅降级更新 DB；EditMetaModal 关闭时 `onClose(changed=true)` 触发详情刷新（封面经内容去重换新路径，不刷新页面会停留旧图） |
 | `get_settings` / `save_settings` | LLM 多 Provider（各含 Endpoint / API Key / 模型）+ 默认服务商/模型 + token 预算 + 模型价格表 + 用量与预估成本（逐模型 + 合计；`pricing_effective` 为"显式配置→内置预设"解析后的展示值） | 旧版单 provider 平铺配置自动迁移；名称去重校验；价格为非负数、按模型去重 |
+| `recover_covers` | 手动触发封面缺失恢复（扫描 → 逐本恢复 → 落库；进度经 task-progress 推送） | 恢复链：同书来源本地缓存 → EPUB 内嵌封面（副本→原始）→ 来源远程直链（OSS 伪装）→ 豆瓣 og:image → clasp 详情；**启动时自动执行**（延迟 8s 后台跑，完成广播 `covers-recovered` 事件，前端有恢复时刷新书架并提示） |
 | `reset_llm_usage` | 清零 `llm_usage` 用量统计（预算周期重置；不影响书籍数据） | 前端确认框 |
 | `llm_status` | LLM 可用性预检（合并本简介导入前提示） | 未配置返回 configured=false |
 | `set_book_status` | 切换阅读状态（想读/在读/已读，已读自动记录完成时间） | 状态值白名单校验 |

@@ -7,6 +7,7 @@ import {
   deleteLibrary,
   getConfig,
   getSettings,
+  recoverCovers,
   resetLlmUsage,
   saveLibrary,
   saveSettings,
@@ -64,6 +65,32 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const [saved, setSaved] = useState(false);
   const [libError, setLibError] = useState<string | null>(null);
   const [resettingUsage, setResettingUsage] = useState(false);
+  /** 手动封面恢复（busy / 结果提示） */
+  const [coverRecovering, setCoverRecovering] = useState(false);
+  const [coverResult, setCoverResult] = useState<string | null>(null);
+
+  /** 手动触发封面缺失恢复（与启动自动恢复共用后端逻辑） */
+  const onRecoverCovers = async () => {
+    if (coverRecovering) return;
+    setCoverRecovering(true);
+    setCoverResult(null);
+    setLibError(null);
+    try {
+      const r = await recoverCovers();
+      setCoverResult(
+        r.missing === 0
+          ? `扫描 ${r.scanned} 本书，封面全部正常`
+          : `缺失 ${r.missing}，恢复 ${r.recovered}` +
+              (r.failed > 0 ? `，失败 ${r.failed}（详见日志）` : ""),
+      );
+      // 有恢复时刷新书架与详情（封面已回填）
+      if (r.recovered > 0) window.dispatchEvent(new CustomEvent("mna:library-refresh"));
+    } catch (e) {
+      setLibError(String(e));
+    } finally {
+      setCoverRecovering(false);
+    }
+  };
 
   // 子选项卡选中项
   const [libSelId, setLibSelId] = useState<string | null>(null);
@@ -385,6 +412,19 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
 
               {libError && <div className="modal-error">{libError}</div>}
+
+              {/* 封面缺失自检与恢复（启动时自动执行；此处可手动重跑） */}
+              <div className="lib-tools-row">
+                <button
+                  className="btn small"
+                  onClick={() => void onRecoverCovers()}
+                  disabled={coverRecovering || loading}
+                  title="扫描全部书籍，对缺失封面按 本地缓存 → EPUB 内嵌 → 远程来源 依次恢复"
+                >
+                  {coverRecovering ? "恢复中…" : "恢复缺失封面"}
+                </button>
+                {coverResult && <span className="webdav-status ok">{coverResult}</span>}
+              </div>
 
               {selectedLib && (
                 <LibraryCard
