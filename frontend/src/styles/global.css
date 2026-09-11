@@ -2205,6 +2205,36 @@ a {
   color: var(--accent);
 }
 
+/* GFM 表格（书虫回复）：窄面板内横向滚动，避免撑破气泡 */
+.chat-md .table-wrap {
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+
+.chat-md table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+  font-family: var(--sans);
+}
+
+.chat-md th,
+.chat-md td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.chat-md th {
+  background: var(--panel-2);
+  color: var(--ink);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-md tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.03);
+}
+
 /* 浏览器内新建文件夹行 */
 .fs-mkdir-row {
   display: flex;
