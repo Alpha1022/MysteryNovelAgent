@@ -13,3 +13,9 @@ opencode.json
 
 # 课程展示课件（不随仓库分发）
 presentation/
+
+# 对话信息（不随仓库分发）
+sessions/
+
+# 课程设计文档（不随仓库分发）
+design/
