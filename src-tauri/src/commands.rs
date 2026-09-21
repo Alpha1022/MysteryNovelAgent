@@ -2636,14 +2636,14 @@ fn truncate_for_prompt(s: &str, max: usize) -> String {
   }
 }
 
-/// 构建 Chatbot 系统提示：注入当前书库、书籍、简介与短评知识 + 工具使用指引
+/// 构建 Chatbot 系统提示：注入当前书库全量书目（书名/作者/系列，按已读/未读分组）+ 工具使用指引
 ///
-/// 注入量刻意克制（书 40 本、简介/短评/书评截断）：系统提示随书库规模线性膨胀，
-/// 过长的 prompt 会显著拉长生成耗时甚至触发网关重置连接
-/// （表现为「网络错误: error sending request for url (…/chat/completions)」）。
-/// 更多细节由模型经 search_books / get_book_detail 等工具按需检索。
+/// 概览刻意精简：只列书名/作者/系列，简介、短评、书评等长文本一律不注入，
+/// 由模型经 search_books / get_book_detail / get_book_comments 等工具按需检索，
+/// 因此可以全量列出书目（上限 CHATBOT_KNOWLEDGE_BOOKS，超出部分提示用工具检索），
+/// 而不会让系统提示随书库规模线性膨胀到触发网关重置连接。
 fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -> String {
-  const CHATBOT_KNOWLEDGE_BOOKS: usize = 40;
+  const CHATBOT_KNOWLEDGE_BOOKS: usize = 1000;
   let cfg = AppConfig::load();
   let lib_title = cfg
     .current_library()
@@ -2661,48 +2661,53 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
     )
     .unwrap_or_default();
 
+  // 已读（按读完时间升序，无日期的排最后）与未读（想读/在读）分组
+  let (read, unread): (Vec<&db::ChatbotBookRow>, Vec<&db::ChatbotBookRow>) =
+    books.iter().partition(|b| b.status == "已读");
+  let mut read = read;
+  read.sort_by(|a, b| match (&a.finished_date, &b.finished_date) {
+    (Some(x), Some(y)) => x.cmp(y),
+    (Some(_), None) => std::cmp::Ordering::Less,
+    (None, Some(_)) => std::cmp::Ordering::Greater,
+    (None, None) => std::cmp::Ordering::Equal,
+  });
+
   let mut knowledge = String::new();
-  for (i, b) in books.iter().enumerate() {
-    if i >= CHATBOT_KNOWLEDGE_BOOKS {
-      knowledge.push_str(&format!("…（其余 {} 本省略，可用工具检索）\n", books.len() - CHATBOT_KNOWLEDGE_BOOKS));
-      break;
-    }
+  knowledge.push_str("【已读】（按读完时间先后排序）\n");
+  if read.is_empty() {
+    knowledge.push_str("（暂无）\n");
+  }
+  for b in &read {
+    knowledge.push_str(&chatbot_book_line(b, true));
+  }
+  knowledge.push_str("\n【未读】（想读 / 在读）\n");
+  if unread.is_empty() {
+    knowledge.push_str("（暂无）\n");
+  }
+  for b in &unread {
+    knowledge.push_str(&chatbot_book_line(b, false));
+  }
+  if books.len() >= CHATBOT_KNOWLEDGE_BOOKS {
     knowledge.push_str(&format!(
-      "- 《{}》｜作者：{}｜状态：{}{}\n",
-      b.title,
-      if b.author.is_empty() { "佚名" } else { &b.author },
-      b.status,
-      b.finished_date
-        .as_deref()
-        .map(|d| format!("｜读完于 {d}"))
-        .unwrap_or_default()
+      "…（书库较大，仅列出前 {} 本，其余可用工具检索）\n",
+      CHATBOT_KNOWLEDGE_BOOKS
     ));
-    if !b.tags.trim().is_empty() {
-      knowledge.push_str(&format!("  标签：{}\n", b.tags));
-    }
-    if let Some(d) = b.description.as_deref().filter(|s| !s.trim().is_empty()) {
-      knowledge.push_str(&format!("  简介：{}\n", truncate_for_prompt(d, 80)));
-    }
-    if let Ok(cs) = db::get_top_comments(conn, b.id, 1) {
-      for c in cs {
-        knowledge.push_str(&format!("  短评：{}\n", truncate_for_prompt(&c, 60)));
-      }
-    }
-    if let Some(r) = b.my_review.as_deref().filter(|s| !s.trim().is_empty()) {
-      knowledge.push_str(&format!("  我的书评：{}\n", truncate_for_prompt(r, 60)));
-    }
   }
 
   format!(
     "你是本地推理小说书架应用的阅读助手「书虫」。用户正在使用「{lib_title}」书库（共 {total} 本书）。\
 你可以回答关于这些书的问题、推荐阅读、比较作品、根据状态与短评总结用户的阅读品味。\
 回答使用简体中文，语气自然，避免剧透关键结局。\n\n\
-注意：书库知识中的「短评」来自网络公开短评（豆瓣 / claspclub 的网友撰写），\
-它们代表网络上读者的看法，并不是用户本人的想法；「我的书评」才是用户本人的评论。\n\n\
-你可以使用以下本地工具查询书库（需要某本书的完整简介、个人书评、系列信息，\
+注意：书库概览只含书目骨架（书名/作者/系列），不含简介与短评；\
+通过 get_book_comments 查到的网络短评来自公开网络（豆瓣 / claspclub 的网友撰写），\
+它们代表网络上读者的看法，并不是用户本人的想法；get_book_detail 中的「我的书评」才是用户本人的评论。\n\n\
+你可以使用以下本地工具查询书库（需要某本书的完整简介、个人书评、网络短评，\
 或按状态/作者/标签检索时，请主动调用工具，不要凭空猜测）：\n\
 - search_books：按关键词搜索书籍（匹配书名/作者）\n\
-- filter_books：按阅读状态/作者/标签筛选书籍\n\
+- filter_books：按阅读状态（想读/在读/已读）、作者、标签筛选书籍；\
+其中 tag 参数按标签包含匹配（如 tag=\"本格\" 列出所有带「本格」标签的书），\
+用户按题材/类别找书（「有哪些社会派」「推荐几本新本格」）、按标签罗列藏书\
+或统计某作者全部作品时优先用它\n\
 - get_book_detail：查看某本书的完整详情（book_id 来自搜索/筛选结果）\n\
 - get_book_comments：查看某本书的网络短评列表\n\
 - search_claspclub：在线书目库检索 —— 书架之外的问题（某作者还写过什么、\
@@ -2715,11 +2720,33 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
 - merge_books：把多本（上下册/系列）按顺序合并为合集\n\
 写操作不会直接生效——应用会弹出确认或编辑窗口，由用户最终确认。\
 调用后请告知用户「已在界面弹出窗口，请在窗口中确认」，不要声称已完成修改。\n\n\
-== 书库概览（含每本书的简短简介与短评节选）==\n{knowledge}",
+== 书库概览（书名/作者/系列，按已读/未读分组；简介与短评请用工具查询）==\n{knowledge}",
     lib_title = lib_title,
     total = books.len(),
     knowledge = knowledge
   )
+}
+
+/// 概览条目：`- 《书名》｜作者：xx｜系列：yy #N`（已读组附带读完日期）
+fn chatbot_book_line(b: &db::ChatbotBookRow, show_finished: bool) -> String {
+  let mut line = format!(
+    "- 《{}》｜作者：{}",
+    b.title,
+    if b.author.is_empty() { "佚名" } else { &b.author }
+  );
+  if let Some(name) = b.series_name.as_deref().filter(|s| !s.trim().is_empty()) {
+    match b.series_order {
+      Some(o) => line.push_str(&format!("｜系列：{name} #{o}")),
+      None => line.push_str(&format!("｜系列：{name}")),
+    }
+  }
+  if show_finished {
+    if let Some(d) = b.finished_date.as_deref() {
+      line.push_str(&format!("｜读完于 {d}"));
+    }
+  }
+  line.push('\n');
+  line
 }
 
 /// Chatbot 工具定义（OpenAI function calling 格式）

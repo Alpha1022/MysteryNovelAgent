@@ -751,6 +751,8 @@ pub struct ChatbotBookRow {
   pub description: Option<String>,
   pub my_review: Option<String>,
   pub finished_date: Option<String>,
+  pub series_name: Option<String>,
+  pub series_order: Option<i64>,
 }
 
 /// Chatbot 工具/概览：按关键词、状态、作者、标签检索书籍（可选限定书库）
@@ -767,7 +769,8 @@ pub fn search_chatbot_books(
 ) -> SqlResult<Vec<ChatbotBookRow>> {
   let mut stmt = conn.prepare(
     "SELECT id, title, COALESCE(author,''), COALESCE(status,'想读'), COALESCE(tags,''),
-            description, my_review, CAST(finished_date AS TEXT)
+            description, my_review, CAST(finished_date AS TEXT),
+            series_name, series_order
      FROM books
      WHERE (?1 IS NULL OR library_id = ?1)
        AND (?2 IS NULL
@@ -791,6 +794,8 @@ pub fn search_chatbot_books(
         description: row.get(5)?,
         my_review: row.get(6)?,
         finished_date: row.get(7)?,
+        series_name: row.get(8)?,
+        series_order: row.get(9)?,
       })
     },
   )?;
