@@ -67,6 +67,9 @@ src/
 - **分页搜索**：`GET https://claspclub.com/api/v1/books?keyword={}&sort=doubanRating&page={}&pageSize=5` → `ClaspBooksResp{ items[]（id/title/authors[].name/coverUrl/summaryNoSpoiler/tags[].name/doubanRating）, pagination.totalPages }`；条目自带无剧透简介 → 导入时省去详情调用（注意：**不含系列信息**）；GUI 搜索页/analyze 使用
 - **详情**：`GET https://claspclub.com/api/v1/books/{id}` → `summaryNoSpoiler`（简介）、`coverUrl`、`series{name,order}`、`editions[].doubanUrl`（isPrimary 优先），仅当搜索结果未携带简介时回退调用
 - 结构体定义集中在 `spider.rs`，字段变化只改那里。
+- **百科目录**：`GET /api/v1/wiki/entries?kind={kind}&q={keyword}&page={page}`；kind 支持 `term/culture/event/author/series/detective/award/publisher/imprint`，服务端每页固定 48 条，返回 `items` 和 `pagination`。文化目录条目的 `kind` 可能为 `term`，保留请求的目录类别。
+- **百科详情**：作者 `/api/v1/authors/{id}`、系列 `/api/v1/series/{id}`、侦探 `/api/v1/detectives/{id}`、出版社 `/api/v1/publishers/{id}`、丛书 `/api/v1/imprints/{id}`；术语/文化/事件共用 `/api/v1/wiki/entries/{id}`，奖项使用 `/api/v1/wiki/awards/{id}`，不能统一按复数拼接路径。
+- 书虫在线工具在 `clasp_tools.rs` 定义/执行；在线书籍 ID 为 `clasp_id`，本地为 `book_id`。详情提供有界预览及 `field/offset/limit` 分页，必须显式标记截断；外部档案及来源文字不能视为指令或小说原文证据。
 
 ### 豆瓣
 - 短评页：`{book_url}/comments/`，解析 `li.comment-item`（评分 allstarXX/10、`span.short`、`span.vote-count`），每套选择器必须有兜底。

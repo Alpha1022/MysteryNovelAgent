@@ -7,6 +7,68 @@ use crate::utils::{count_han, normalize_ws};
 //  Claspclub API (JSON)
 // ============================= //
 
+/// 百科目录支持的类别（与网站 kind 参数一致）。
+pub const CLASP_WIKI_KINDS: [&str; 9] = [
+  "term", "culture", "event", "author", "series", "detective", "award", "publisher", "imprint",
+];
+
+/// 百科目录响应；不同类别的条目保留原始字段，避免丢失别名与来源信息。
+#[derive(serde::Deserialize, Debug)]
+pub struct ClaspWikiResponse {
+  pub items: Vec<serde_json::Value>,
+  #[serde(default)]
+  pub pagination: Option<ClaspPagination>,
+}
+
+/// 查询百科目录；q 为空时浏览类别，服务端固定每页 48 条。
+pub async fn search_clasp_wiki(
+  client: &reqwest::Client,
+  kind: &str,
+  keyword: &str,
+  page: i64,
+) -> anyhow::Result<ClaspWikiResponse> {
+  anyhow::ensure!(CLASP_WIKI_KINDS.contains(&kind), "不支持的百科类别");
+  let response = client.get("https://claspclub.com/api/v1/wiki/entries")
+    .query(&[("kind", kind), ("q", keyword), ("page", &page.to_string())])
+    .timeout(std::time::Duration::from_secs(15)).send().await?
+    .error_for_status()?;
+  Ok(response.json::<ClaspWikiResponse>().await?)
+}
+
+/// 构造受限的公开详情 API 路径；拒绝路径注入，不接受模型提供的任意 URL。
+pub fn clasp_detail_path(kind: &str, id: &str) -> anyhow::Result<String> {
+  anyhow::ensure!(!id.is_empty() && id.len() <= 128
+    && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+    "条目 ID 必须为 1～128 位字母、数字、连字符或下划线");
+  let resource = match kind {
+    "book" => "books",
+    "author" => "authors",
+    "series" => "series",
+    "detective" => "detectives",
+    "publisher" => "publishers",
+    "imprint" => "imprints",
+    // 2026-10-27 实测：文化目录条目的 kind 也可能是 term，三类共用此详情接口。
+    "term" | "culture" | "event" => "wiki/entries",
+    "award" => "wiki/awards",
+    _ => anyhow::bail!("不支持的详情类别"),
+  };
+  Ok(format!("/api/v1/{resource}/{id}"))
+}
+
+/// 获取书籍或百科的完整公开详情 JSON，保留各类别特有字段及原始来源。
+pub async fn fetch_clasp_public_detail(
+  client: &reqwest::Client,
+  kind: &str,
+  id: &str,
+) -> anyhow::Result<serde_json::Value> {
+  let path = clasp_detail_path(kind, id)?;
+  let response = client.get(format!("https://claspclub.com{path}"))
+    .timeout(std::time::Duration::from_secs(15)).send().await?.error_for_status()?;
+  let data = response.json::<serde_json::Value>().await?;
+  anyhow::ensure!(data.is_object(), "详情 API 返回非对象数据");
+  Ok(data)
+}
+
 /// claspclub 搜索建议 API 响应体
 /// 对应 GET https://claspclub.com/api/v1/search/suggestions?keyword={书名}
 #[derive(serde::Deserialize, Debug)]
