@@ -176,17 +176,10 @@ jobs:
         run: command -v cargo-tauri >/dev/null 2>&1 || cargo install --locked tauri-cli --version "^2"
       # GitHub runner 自带 Android SDK（ANDROID_HOME 已设置），补装本项目
       # 所需组件：compileSdk 36 / build-tools / NDK（gradle 8.14 + AGP 8.11）
+      - name: 验证 SDK 安装恢复脚本
+        run: python3 .github/scripts/test_install_android_sdk.py
       - name: 安装 Android SDK 组件与 NDK
-        run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" \
-            "build-tools;35.0.0" "build-tools;36.0.0" \
-            "ndk;${ANDROID_NDK_VERSION}" > /dev/null
-          NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+        run: bash .github/scripts/install-android-sdk.sh
       # 签名：解码 KEYSTORE_BASE64 → keystore 文件并预检（口令/别名正确性），
       # 缺 Secrets 或密钥无效时快速失败 —— 不等全量 Rust 编译后才在签名环节报错
       - name: 准备签名密钥

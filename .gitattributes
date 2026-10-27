@@ -1,0 +1,2 @@
+# CI Bash 脚本在 Windows 检出时也必须保留 Unix 换行。
+*.sh text eol=lf
