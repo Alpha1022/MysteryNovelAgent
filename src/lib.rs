@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod book_text;
 pub mod commands;
 pub mod config;
 pub mod db;
