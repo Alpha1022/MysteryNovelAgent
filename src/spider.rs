@@ -218,6 +218,18 @@ pub fn douban_book_url(subject_id: &str) -> String {
   format!("https://book.douban.com/subject/{subject_id}/")
 }
 
+/// 从豆瓣书籍页或短评页链接提取 subject ID，拒绝其他域名及非数字 ID。
+pub fn douban_subject_id(input: &str) -> Option<String> {
+  let url = reqwest::Url::parse(input.trim()).ok()?;
+  if !matches!(url.scheme(), "http" | "https") || url.host_str() != Some("book.douban.com") {
+    return None;
+  }
+  let mut parts = url.path_segments()?;
+  if parts.next()? != "subject" { return None; }
+  let id = parts.next()?;
+  (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
+}
+
 /// 调用详情 API 获取书籍的简介、封面、系列、豆瓣链接
 pub async fn fetch_book_detail(
   client: &reqwest::Client,

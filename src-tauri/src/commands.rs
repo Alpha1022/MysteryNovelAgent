@@ -2830,7 +2830,7 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "get_book_comments",
-        "description": "查看某本书的网络短评列表（豆瓣 / claspclub 网友短评）",
+        "description": "查看某本书的网络短评列表（豆瓣 / claspclub 网友短评）；多作品合集会额外提供每条豆瓣短评的 douban_id 和 douban_title，无法定位时为 null",
         "parameters": {
           "type": "object",
           "properties": {
@@ -2940,6 +2940,47 @@ fn chatbot_text_path(
   Ok((id, path))
 }
 
+fn has_multiple_source_ids(raw: Option<&str>) -> bool {
+  raw.and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+    .map(|ids| ids.into_iter().filter_map(|id| match id {
+      serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+      serde_json::Value::Number(n) if n.as_i64().is_some_and(|v| v > 0) => Some(n.to_string()),
+      _ => None,
+    }).collect::<std::collections::HashSet<_>>().len() > 1)
+    .unwrap_or(false)
+}
+
+fn chatbot_comment_sources(conn: &rusqlite::Connection, book_id: i64) -> Option<Vec<db::SourceRow>> {
+  let book = db::get_book_detail(conn, book_id).ok().flatten()?;
+  // 导入时多选作品或由至少两本本地书合并；多个豆瓣版本本身不构成合集。
+  if !has_multiple_source_ids(book.clasp_ids.as_deref())
+    && !has_multiple_source_ids(book.merged_from.as_deref()) {
+    return None;
+  }
+  Some(db::list_sources(conn, book_id).unwrap_or_else(|e| {
+    warn!("书虫读取合集短评来源失败: {e}");
+    Vec::new()
+  }))
+}
+
+fn chatbot_comment_item(comment: &db::CommentRow, sources: Option<&[db::SourceRow]>) -> serde_json::Value {
+  let mut item = serde_json::json!({
+    "source": comment.source,
+    "rating": comment.rating,
+    "content": truncate_for_prompt(&comment.content, 150),
+  });
+  if let Some(sources) = sources {
+    let id = (comment.source == "豆瓣").then(|| comment.source_ref.as_deref()
+      .and_then(spider::douban_subject_id)).flatten();
+    let title = id.as_deref().and_then(|id| sources.iter().find(|s| {
+      s.kind == "douban" && spider::douban_subject_id(&s.ref_key).as_deref() == Some(id)
+    })).and_then(|s| s.title.as_deref()).map(str::trim).filter(|s| !s.is_empty());
+    item["douban_id"] = serde_json::json!(id);
+    item["douban_title"] = serde_json::json!(title);
+  }
+  item
+}
+
 /// 执行 Chatbot 工具调用（本地数据库查询），返回 JSON 字符串给模型
 fn execute_chatbot_tool(
   conn: &rusqlite::Connection,
@@ -3027,17 +3068,12 @@ fn execute_chatbot_tool(
       let limit = get_i64("limit").unwrap_or(5).clamp(1, 10);
       match db::get_comments_for_book(conn, id) {
         Ok(rows) => {
+          let sources = chatbot_comment_sources(conn, id);
           let items: Vec<serde_json::Value> = rows
             .iter()
             .filter(|c| c.is_mine != 1)
             .take(limit as usize)
-            .map(|c| {
-              serde_json::json!({
-                "source": c.source,
-                "rating": c.rating,
-                "content": truncate_for_prompt(&c.content, 150),
-              })
-            })
+            .map(|c| chatbot_comment_item(c, sources.as_deref()))
             .collect();
           serde_json::json!({ "count": items.len(), "comments": items }).to_string()
         }
@@ -4031,6 +4067,44 @@ mod tests {
 
   fn mem_db() -> rusqlite::Connection {
     db::open_db(":memory:").unwrap()
+  }
+
+  #[test]
+  fn collection_comments_include_their_douban_book_only_for_collections() {
+    let conn = mem_db();
+    let id = db::insert_book(&conn, "馆系列合集", "绫辻行人", "推理小说", "books.epub", "[]").unwrap();
+    for (url, title) in [
+      ("https://book.douban.com/subject/123/", "钟表馆事件"),
+      ("https://book.douban.com/subject/456/", "十角馆事件"),
+    ] {
+      conn.execute("INSERT INTO sources (book_id, kind, ref, title) VALUES (?1, 'douban', ?2, ?3)",
+        rusqlite::params![id, url, title]).unwrap();
+      db::insert_comment(&conn, id, Some(5), title, 100, "豆瓣", Some(&format!("{url}comments/?sort=new"))).unwrap();
+    }
+    db::insert_comment(&conn, id, None, "旧短评", 1, "豆瓣", None).unwrap();
+    db::insert_comment(&conn, id, None, "暗扣短评", 0, "claspclub", Some("clasp-a")).unwrap();
+    let args = serde_json::json!({"book_id": id});
+    let query = || serde_json::from_str::<serde_json::Value>(
+      &execute_chatbot_tool(&conn, None, "get_book_comments", &args)).unwrap();
+    // 多个豆瓣来源也可能只是同一作品的不同版本，不据此判断合集。
+    assert!(query()["comments"].as_array().unwrap().iter().all(|c| c.get("douban_id").is_none()));
+    conn.execute("UPDATE books SET clasp_ids = '[\"clasp-a\",\"clasp-b\"]' WHERE id = ?1", [id]).unwrap();
+    let result = query();
+    let comments = result["comments"].as_array().unwrap();
+    for (title, douban_id) in [("钟表馆事件", "123"), ("十角馆事件", "456")] {
+      let comment = comments.iter().find(|c| c["content"] == title).unwrap();
+      assert_eq!(comment["douban_title"], title);
+      assert_eq!(comment["douban_id"], douban_id);
+    }
+    assert!(comments.iter().filter(|c| c["content"] == "旧短评" || c["source"] == "claspclub")
+      .all(|c| c["douban_id"].is_null() && c["douban_title"].is_null()));
+    conn.execute("UPDATE books SET clasp_ids = '[]', merged_from = '[1,2]' WHERE id = ?1", [id]).unwrap();
+    assert!(query()["comments"][0].get("douban_id").is_some());
+    assert!(!has_multiple_source_ids(Some("[1,1]")));
+    assert!(!has_multiple_source_ids(Some("not-json")));
+    assert!(!has_multiple_source_ids(Some("[null,\"\"]")));
+    assert_eq!(spider::douban_subject_id("https://example.com/subject/123/"), None);
+    assert_eq!(spider::douban_subject_id("https://book.douban.com/subject/abc/"), None);
   }
 
   #[test]
