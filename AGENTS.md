@@ -130,3 +130,13 @@ cargo run -- --help  # 验证 CLI 结构
 - **RAG 全书问答**：`embeddings` 表已预留（`chunk_text TEXT, vector BLOB`），后续可接 sqlite-vec / candle。
 - **GUI**：业务逻辑（spider/merge/library/device）均不依赖终端交互，仅依赖 `Path` + `Connection`，可直接被 Tauri 等前端复用；仅需替换 config 读取与交互确认层。
 - 多 renditions EPUB、MTP 设备同步（需 libmtp/Windows MTP API）暂不支持。
+
+---
+
+## 10. Git 推送规则
+
+- 本地主分支为 `master`，两个远程仓库的目标分支不同，推送时必须显式指定映射：
+  - GitHub（`github`）：`git push github master:main`（本地 `master` → GitHub `main`）。
+  - 清华 GitLab（`origin`）：`git push origin master:master`（本地 `master` → 清华 GitLab `master`）。
+- 用户要求同步两个仓库时，分别执行以上命令；不要用 `git push github master`，它会推到错误的 GitHub `master` 分支。
+- 若当前在其他本地分支，先确认待推送提交，再显式指定来源分支与上述远程目标分支，不要颠倒 refspec 的 `来源:目标` 方向。
