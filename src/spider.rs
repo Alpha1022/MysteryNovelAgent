@@ -230,6 +230,144 @@ pub fn douban_subject_id(input: &str) -> Option<String> {
   (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
 }
 
+/// 豆瓣在线评论页的必要信息，不保留整页 HTML。
+pub struct DoubanDiscussionPage {
+  pub book_title: Option<String>,
+  pub items: Vec<serde_json::Value>,
+  pub has_next: bool,
+}
+
+/// 豆瓣书评全文接口响应：html 是正文，body 含作者、剧透提示及操作区。
+#[derive(serde::Deserialize)]
+pub struct DoubanFullReviewResponse {
+  pub html: Option<String>,
+  pub body: Option<String>,
+  #[serde(default)]
+  pub votes: serde_json::Value,
+}
+
+fn first_element<'a>(root: ElementRef<'a>, selectors: &[&str]) -> Option<ElementRef<'a>> {
+  selectors.iter().filter_map(|s| Selector::parse(s).ok())
+    .find_map(|s| root.select(&s).next())
+}
+
+fn element_text(root: ElementRef<'_>, selectors: &[&str]) -> Option<String> {
+  first_element(root, selectors).map(|e| douban_html_text(&e.html())).filter(|s| !s.is_empty())
+}
+
+fn vote_number(root: ElementRef<'_>, selectors: &[&str]) -> Option<i64> {
+  let text = element_text(root, selectors)?;
+  text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
+}
+
+/// HTML 转纯文本，保留段落与 br；忽略脚本、样式及展开按钮。
+pub fn douban_html_text(html: &str) -> String {
+  fn collect(root: ElementRef<'_>, out: &mut String) {
+    let tag = root.value().name();
+    if matches!(tag, "script" | "style" | "head" | "iframe" | "noscript")
+      || root.value().classes().any(|c| matches!(c, "unfold" | "spoiler-tip" | "main-title-tip")) { return; }
+    let block = matches!(tag, "p" | "div" | "section" | "blockquote" | "li" | "br" | "h1" | "h2" | "h3" | "tr");
+    if block { out.push('\n'); }
+    for child in root.children() {
+      match child.value() {
+        scraper::Node::Text(t) => out.push_str(t),
+        scraper::Node::Element(_) => if let Some(e) = ElementRef::wrap(child) { collect(e, out); },
+        _ => {}
+      }
+    }
+    if block { out.push('\n'); }
+  }
+  let doc = Html::parse_fragment(html);
+  let mut out = String::new();
+  collect(doc.root_element(), &mut out);
+  out.lines().map(normalize_ws).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+/// 解析豆瓣在线短评/热门书评列表；反爬或未知结构报错，避免伪装成空结果。
+pub fn parse_douban_discussions(html: &str, reviews: bool) -> anyhow::Result<DoubanDiscussionPage> {
+  let doc = Html::parse_document(html);
+  let root = doc.root_element();
+  // 2026-10-27 实测：短评为 #comments > li.comment-item；书评为 .review-list .review-item。
+  // 旧版结构兜底：短评 li[data-cid]、书评 .main.review-item。
+  let selectors = if reviews { [".review-list .review-item", ".main.review-item"] }
+    else { ["#comments li.comment-item", "li[data-cid]"] };
+  let mut items = Vec::new();
+  for selector in selectors {
+    let selector = Selector::parse(selector).map_err(|e| anyhow::anyhow!("评论选择器错误: {e}"))?;
+    for item in doc.select(&selector) {
+      // 短评：.comment-info a / .comment-time / span.short / .vote-count。
+      // 书评：h2 a[href] / .main-hd .name / .main-meta / .short-content / .action .up、.down。
+      let content = element_text(item, if reviews { &[".short-content", ".review-short"] }
+        else { &["span.short", "p.comment-content"] });
+      let Some(content) = content else { continue; };
+      let id = item.value().attr(if reviews { "id" } else { "data-cid" })
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+      let mut value = serde_json::json!({"id":id,"rating":parse_rating(&item),"content":content,
+        "author":element_text(item, if reviews { &[".main-hd .name", "header a.name"] } else { &[".comment-info a", ".avatar a"] }),
+        "date":element_text(item, if reviews { &[".main-meta", "header time"] } else { &[".comment-time", ".comment-info time"] }),
+        "usefulness":vote_number(item, if reviews { &[".action .up", ".action [title='有用']"] } else { &[".vote-count", "span[id^='c-']"] }).unwrap_or(0)});
+      if reviews {
+        value["title"] = serde_json::json!(element_text(item, &["h2 a", "h2"]));
+        value["spoiler"] = serde_json::json!(first_element(item, &[".spoiler-tip", ".main-title-tip"]).is_some());
+        value["uselessness"] = serde_json::json!(vote_number(item, &[".action .down", ".action [title='没用']"]));
+      }
+      if let Some(id) = id {
+        value["url"] = serde_json::json!(if reviews { format!("https://book.douban.com/review/{id}/") }
+          else { format!("https://book.douban.com/comment/{id}/") });
+      }
+      items.push(value);
+    }
+    if !items.is_empty() { break; }
+  }
+  // 正常空列表有 #comments / .review-list 容器；验证/登录页没有这些容器。
+  anyhow::ensure!(!items.is_empty() || first_element(root, if reviews { &[".review-list"] } else { &["#comments"] }).is_some(),
+    "豆瓣页面不是可识别的评论列表，可能需要登录、遇到访问限制或页面结构变化");
+  // 短评 #paginator a[data-page=next]；书评 .paginator 的 rel=next（a/link 两种结构）。
+  let has_next = first_element(root, &["#paginator a[data-page='next'][href]", ".paginator [rel='next'][href]", ".paginator .next a[href]"]).is_some();
+  let book_title = element_text(root, &["#content h1", "h1"]).map(|s| {
+    if reviews { s.split("的书评").next().unwrap_or(&s).trim().to_string() }
+    else { s.trim_end_matches("短评").trim().to_string() }
+  });
+  Ok(DoubanDiscussionPage { book_title, items, has_next })
+}
+
+/// 提取书评全文接口的正文、作者、剧透标识、投票数与正文图片链接。
+pub fn parse_douban_full_review(data: DoubanFullReviewResponse) -> anyhow::Result<serde_json::Value> {
+  let body = data.body.as_deref().unwrap_or("");
+  let doc = Html::parse_fragment(body);
+  let root = doc.root_element();
+  // 实测 body 的 .review-content[data-author] 包含正文，.main-title-tip 为剧透提示。
+  // html 缺失时退回 body 内 .review-content（旧结构 #link-report-*）。
+  let content_html = data.html.filter(|s| !s.trim().is_empty())
+    .or_else(|| first_element(root, &[".review-content", "[id^='link-report-']"]).map(|e| e.inner_html()))
+    .ok_or_else(|| anyhow::anyhow!("书评全文接口未返回正文，可能需要登录或遇到访问限制"))?;
+  let content = douban_html_text(&content_html);
+  anyhow::ensure!(!content.is_empty(), "书评正文没有可提取文本");
+  let content_doc = Html::parse_fragment(&content_html);
+  // 正文中的 img[data-original] / img[src]；仅返回地址，不下载图片。
+  let image_selector = Selector::parse("img").map_err(|e| anyhow::anyhow!("图片选择器错误: {e}"))?;
+  let images: Vec<_> = content_doc.select(&image_selector).filter_map(|e| e.value().attr("data-original").or_else(|| e.value().attr("src")))
+    .filter(|s| s.starts_with("https://") || s.starts_with("http://")).take(20).collect();
+  Ok(serde_json::json!({"content":content,
+    "author":first_element(root, &[".review-content[data-author]", "[data-author]"]).and_then(|e| e.value().attr("data-author")),
+    "spoiler":first_element(root, &[".main-title-tip", ".spoiler-tip"]).is_some(),
+    "usefulness":data.votes.get("useful_count").or_else(|| data.votes.get("usecount")),
+    "uselessness":data.votes.get("useless_count"),"image_urls":images}))
+}
+
+/// 获取固定豆瓣域名的公开页面；HTTP 错误/登录重定向明确失败，不绕过验证码。
+pub async fn fetch_douban_public(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+  let parsed = reqwest::Url::parse(url)?;
+  anyhow::ensure!(parsed.scheme() == "https" && parsed.host_str() == Some("book.douban.com"), "仅允许豆瓣图书公开接口");
+  let bid = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+  let response = client.get(parsed).timeout(std::time::Duration::from_secs(15))
+    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    .header("Referer", "https://book.douban.com/").header("Cookie", format!("bid={}", &bid[..bid.len().min(11)]))
+    .send().await?.error_for_status()?;
+  anyhow::ensure!(response.url().host_str() == Some("book.douban.com"), "豆瓣请求重定向到登录或验证页面");
+  Ok(response.text().await?)
+}
+
 /// 调用详情 API 获取书籍的简介、封面、系列、豆瓣链接
 pub async fn fetch_book_detail(
   client: &reqwest::Client,
@@ -788,6 +926,54 @@ pub async fn fetch_clasp_reviews(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn online_douban_parsers_preserve_metadata_and_reject_unknown_pages() {
+    let comments = parse_douban_discussions(r#"<h1>示例书 短评</h1><div id="comments">
+      <li class="comment-item" data-cid="12"><span class="comment-info"><a>读者甲</a>
+      <span class="allstar40"></span><a class="comment-time">2026-01-01</a></span>
+      <span class="short">文字<b>评价</b>&amp;感想<script>忽略</script></span><span class="vote-count">42</span></li>
+      </div><div id="paginator"><a data-page="next" href="?start=20">后页</a></div>"#, false).unwrap();
+    assert_eq!(comments.book_title.as_deref(), Some("示例书"));
+    assert_eq!(comments.items[0]["content"], "文字评价&感想");
+    assert_eq!(comments.items[0]["rating"], 4);
+    assert_eq!(comments.items[0]["usefulness"], 42);
+    assert!(comments.has_next);
+    let reviews = parse_douban_discussions(r#"<h1>示例书的书评 (2)</h1><div class="review-list">
+      <div class="main review-item" id="99"><header><a class="name">读者乙</a><span class="main-meta">2026-02-02</span></header>
+      <h2><a href="/review/99/">文章标题</a></h2><div class="short-content"><p class="spoiler-tip">剧透</p>
+      正文摘要<a class="unfold">展开</a></div><div class="action"><a class="up">9</a><a class="down">2</a></div></div>
+      </div><div class="paginator"><link rel="next" href="?start=20"></div>"#, true).unwrap();
+    assert_eq!(reviews.book_title.as_deref(), Some("示例书"));
+    assert_eq!(reviews.items[0]["id"], "99");
+    assert_eq!(reviews.items[0]["title"], "文章标题");
+    assert_eq!(reviews.items[0]["content"], "正文摘要");
+    assert_eq!(reviews.items[0]["spoiler"], true);
+    assert!(reviews.has_next);
+    assert!(parse_douban_discussions("<h1>安全验证</h1>", false).is_err());
+    assert!(parse_douban_discussions("<div class='review-list'></div>", true).unwrap().items.is_empty());
+    let fallback = parse_douban_discussions("<li data-cid='3'><p class='comment-content'>旧结构</p></li>", false).unwrap();
+    assert_eq!(fallback.items[0]["content"], "旧结构");
+  }
+
+  #[test]
+  fn full_review_parser_strips_html_and_preserves_paragraphs_and_spoiler() {
+    let data: DoubanFullReviewResponse = serde_json::from_value(serde_json::json!({
+      "html":"<p>第一段<b>文字</b></p>第二段<br>第三段 &amp; 结语<script>忽略</script><img src='https://img.doubanio.com/test.jpg'>",
+      "body":"<div class='main-title-tip'>剧透</div><div class='review-content' data-author='作者甲'>正文</div>",
+      "votes":{"useful_count":9,"useless_count":1}
+    })).unwrap();
+    let result = parse_douban_full_review(data).unwrap();
+    assert_eq!(result["content"], "第一段文字\n第二段\n第三段 & 结语");
+    assert_eq!(result["author"], "作者甲");
+    assert_eq!(result["spoiler"], true);
+    assert_eq!(result["usefulness"], 9);
+    assert_eq!(result["image_urls"][0], "https://img.doubanio.com/test.jpg");
+    let fallback: DoubanFullReviewResponse = serde_json::from_value(serde_json::json!({"body":"<div class='review-content'>旧版全文</div>"})).unwrap();
+    assert_eq!(parse_douban_full_review(fallback).unwrap()["content"], "旧版全文");
+    let blocked: DoubanFullReviewResponse = serde_json::from_value(serde_json::json!({"body":"请登录"})).unwrap();
+    assert!(parse_douban_full_review(blocked).is_err());
+  }
 
   #[test]
   fn test_extract_douban_id() {

@@ -5,6 +5,7 @@ pub mod commands;
 pub mod config;
 pub mod db;
 pub mod device;
+pub mod douban_tools;
 pub mod finish;
 pub mod ingestion;
 pub mod library;

@@ -72,6 +72,9 @@ src/
 - 书虫在线工具在 `clasp_tools.rs` 定义/执行；在线书籍 ID 为 `clasp_id`，本地为 `book_id`。详情提供有界预览及 `field/offset/limit` 分页，必须显式标记截断；外部档案及来源文字不能视为指令或小说原文证据。
 
 ### 豆瓣
+- 书虫在线工具：`get_douban_comments` 使用 `/subject/{douban_id}/comments/?sort=score&status=P&start={start}`；`get_douban_reviews` 使用 `/subject/{douban_id}/reviews?sort=hotest&start={start}`；`get_douban_review_full` 使用 `/j/review/{review_id}/full`。HTML 解析集中在 `spider.rs`，工具定义与执行在 `douban_tools.rs`。
+- 全文接口返回 JSON，`html` 为正文、`body` 含作者/剧透信息、`votes` 为投票；转换为保留段落的纯文本，支持按字符分页，剥离脚本/样式/展开按钮。遇到反爬或未知结构返回明确错误，不把请求失败当成无评论。
+- 本地 `get_book_comments` 不联网：用已存 `source_ref` 查 `sources` 索引；仅多作品合集附带 `douban_id/douban_title`。多个豆瓣版本本身不代表合集。
 - 短评页：`{book_url}/comments/`，解析 `li.comment-item`（评分 allstarXX/10、`span.short`、`span.vote-count`），每套选择器必须有兜底。
 - 封面兜底：书籍页 `og:image`（随机 `bid` cookie + 浏览器 UA），图片下载带 `Referer: https://book.douban.com/`。
 - 阿里云 OSS 封面必须带 `Referer: https://claspclub.com/`。
