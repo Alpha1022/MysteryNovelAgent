@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "mystery-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dunce",
  "mystery-novel-agent",
@@ -2596,7 +2596,7 @@ dependencies = [
 
 [[package]]
 name = "mystery-novel-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "character_converter",
