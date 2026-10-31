@@ -519,7 +519,7 @@ pub async fn ingest_book(
   }
   info!("搜索关键词候选: {:?}", candidates);
 
-  let client = reqwest::Client::builder()
+  let client = crate::config::AppConfig::load().http_client_builder()
     .timeout(std::time::Duration::from_secs(15))
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     .build()?;
@@ -1593,7 +1593,7 @@ fn pick_silent_match(
 
 /// GUI 专用 HTTP 客户端（详情/搜索 15s 超时 + 浏览器 UA）
 pub fn gui_http_client() -> reqwest::Client {
-  reqwest::Client::builder()
+  crate::config::AppConfig::load().http_client_builder()
     .timeout(std::time::Duration::from_secs(15))
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     .build()

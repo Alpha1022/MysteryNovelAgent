@@ -316,6 +316,7 @@ export interface LlmUsageRow {
 
 /** get_settings 返回 */
 export interface SettingsInfo {
+  use_system_proxy: boolean;
   llm: LlmSettings;
   usage: LlmUsageRow[];
   /** 全模型累计 token 总量 */

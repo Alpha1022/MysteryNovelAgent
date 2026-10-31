@@ -196,6 +196,7 @@ pub fn run() {
       commands::update_book_meta,
       commands::get_settings,
       commands::save_settings,
+      commands::save_network_settings,
       commands::reset_llm_usage,
       commands::recover_covers,
       commands::llm_status,

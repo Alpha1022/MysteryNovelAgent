@@ -279,7 +279,7 @@ async fn chat_once(
   tools: Option<&[serde_json::Value]>,
   timeout: std::time::Duration,
 ) -> Result<ChatOutcome, LlmError> {
-  let client = reqwest::Client::builder().timeout(timeout).build()?;
+  let client = crate::config::AppConfig::load().http_client_builder().timeout(timeout).build()?;
 
   let req = ChatRequest {
     model: config.model.clone(),

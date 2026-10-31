@@ -247,6 +247,11 @@ export function getSettings(): Promise<SettingsInfo> {
   return invoke("get_settings");
 }
 
+/** 保存全局网络代理开关。 */
+export function saveNetworkSettings(useSystemProxy: boolean): Promise<void> {
+  return invoke("save_network_settings", { useSystemProxy });
+}
+
 /** 保存 LLM 设置到 config.toml */
 export function saveSettings(llm: LlmSettings): Promise<void> {
   return invoke("save_settings", { settings: llm });

@@ -3645,6 +3645,7 @@ pub struct LlmUsageDto {
 /// 设置页完整数据（LLM 配置 + 用量/成本统计 + 预算）
 #[derive(Serialize)]
 pub struct SettingsDto {
+  pub use_system_proxy: bool,
   pub llm: LlmSettingsDto,
   pub usage: Vec<LlmUsageDto>,
   /// 全模型累计 token 总量
@@ -3718,6 +3719,7 @@ pub async fn get_settings(
     })
     .collect();
   Ok(SettingsDto {
+    use_system_proxy: cfg.use_system_proxy,
     llm: LlmSettingsDto {
       providers: cfg
         .llm
@@ -3751,6 +3753,14 @@ pub async fn get_settings(
     usage_unpriced,
     pricing_effective,
   })
+}
+
+/// 保存全局代理开关；新建的网络请求立即使用新配置。
+#[tauri::command]
+pub fn save_network_settings(use_system_proxy: bool) -> Result<(), String> {
+  let mut cfg = AppConfig::load();
+  cfg.use_system_proxy = use_system_proxy;
+  cfg.save().map_err(|e| e.to_string())
 }
 
 /// 保存设置到 config.toml（多 Provider）

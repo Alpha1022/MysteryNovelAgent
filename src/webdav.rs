@@ -156,7 +156,7 @@ impl DavClient {
       .collect();
     segments.push(encode_seg(name));
     let base = format!("{url}/{}", segments.join("/"));
-    let http = reqwest::Client::builder()
+    let http = crate::config::AppConfig::load().http_client_builder()
       .timeout(std::time::Duration::from_secs(120))
       .connect_timeout(std::time::Duration::from_secs(10))
       .build()?;

@@ -168,7 +168,7 @@ pub async fn execute(name: &str, args: &Value) -> String {
 }
 
 async fn execute_inner(name: &str, args: &Value) -> anyhow::Result<Value> {
-  let client = reqwest::Client::builder()
+  let client = crate::config::AppConfig::load().http_client_builder()
     .timeout(std::time::Duration::from_secs(15))
     .build()?;
   if name == "search_claspclub_wiki" {

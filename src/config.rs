@@ -196,6 +196,9 @@ impl LlmSettings {
 /// 应用配置（持久化到 config.toml）
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct AppConfig {
+  /// 是否继承系统及环境变量代理；默认直连。
+  #[serde(default)]
+  pub use_system_proxy: bool,
   /// 本地书库根目录（EPUB 统一存放处）—— 旧版单书库字段，加载时迁移进 libraries
   #[serde(default)]
   pub library_path: Option<PathBuf>,
@@ -291,6 +294,16 @@ pub struct LibraryConfig {
 }
 
 impl AppConfig {
+  /// 按网络设置创建客户端构造器；关闭代理时显式禁用自动代理发现。
+  pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if self.use_system_proxy {
+      builder
+    } else {
+      builder.no_proxy()
+    }
+  }
+
   /// 当前书库（current_library 精确匹配 → 第一个；均无则 None）
   pub fn current_library(&self) -> Option<&LibraryConfig> {
     self

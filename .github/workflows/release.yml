@@ -2,14 +2,12 @@
 # GitHub Actions：全平台自动构建与发布
 #
 # 推送方式（本地分支 master → GitHub main）：
-#   git push github master:main        # 滚动构建 + 维护 continuous Release
+#   git push github master:main        # 仅同步源码，不触发构建
 #   git push github v0.1.0             # 正式 Release（需先在本地打 tag）
 #
 # 触发时机：
-#   - push 到 main / 手动触发 → 构建五平台产物：
-#     ① 上传 workflow artifacts（90 天）
-#     ② 维护滚动 Release（tag 固定为 continuous，指向最新提交）
-#   - 推送 v* 标签 → 正式 Release（全部产物挂到该版本）
+#   - 仅推送 v数字.数字.数字 标签 → 构建五平台产物并创建正式 Release
+#   - 上传 workflow artifacts（90 天），全部分发产物挂到对应版本
 #
 # 构建矩阵（GitHub 托管 runner，原生环境无需交叉编译；
 # CLI 已弃用不再构建分发，见 README）：
@@ -39,12 +37,10 @@ name: build-release
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  workflow_dispatch:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
 
 permissions:
-  contents: write # 发布 Release / 创建 continuous tag
+  contents: write # 发布正式 Release
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -295,7 +291,7 @@ jobs:
     name: 发布
     needs: [build-windows, build-linux, build-android, build-macos, build-ios]
     if: >-
-      startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -312,31 +308,12 @@ jobs:
         run: |
           set -eu
           echo "本次产物："; ls -la dist/
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            # 正式版本 Release
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              -R "$REPO" \
-              --title "Release ${GITHUB_REF_NAME}" \
-              --notes "标签 ${GITHUB_REF_NAME} 的自动构建产物：
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            -R "$REPO" \
+            --title "Release ${GITHUB_REF_NAME}" \
+            --notes "标签 ${GITHUB_REF_NAME} 的自动构建产物：
           - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
           - Linux：deb / AppImage
           - Android：universal APK（arm64 + armv7）
           - macOS：universal DMG
           - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）"
-          else
-            # 滚动 Release（正式版，非预发布）：删旧 Release 与 tag 后以当前提交重建（首次运行为空，属正常）
-            gh release delete continuous -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
-            gh release create continuous dist/* \
-              -R "$REPO" \
-              --target "$GITHUB_SHA" \
-              --title "Latest build (${GITHUB_SHA::7})" \
-              --notes "main 分支最新构建（每次 push 自动更新）。
-
-          - Windows：mystery-shelf-windows-x64-setup.exe（NSIS 安装包）
-          - Linux：deb / AppImage
-          - Android：universal APK（arm64 + armv7）
-          - macOS：universal DMG
-          - iOS：仅做 Rust 编译检查（真机分发需 Apple 开发者证书签名）
-
-          正式版本见 v* 标签的 Release。"
-          fi

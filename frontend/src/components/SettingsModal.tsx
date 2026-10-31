@@ -11,6 +11,7 @@ import {
   resetLlmUsage,
   saveLibrary,
   saveSettings,
+  saveNetworkSettings,
   switchLibrary,
   webdavPull,
   webdavPush,
@@ -34,12 +35,16 @@ type LibDraft = LibraryProfile & { __draft?: boolean };
 
 let providerSeq = 0;
 
-type Tab = "library" | "llm" | "webdav";
+type Tab = "library" | "llm" | "webdav" | "network";
 
 /** 配置弹窗：左侧 书库 / LLM 选项卡；各组内多个条目以并列子选项卡切换 */
 export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const { confirm, confirmElement } = useConfirm();
   const [tab, setTab] = useState<Tab>("library");
+  const [useSystemProxy, setUseSystemProxy] = useState(false);
+  const [networkSaving, setNetworkSaving] = useState(false);
+  const [networkError, setNetworkError] = useState<string | null>(null);
+  const [networkSaved, setNetworkSaved] = useState(false);
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [defaultProvider, setDefaultProvider] = useState<string | null>(null);
   const [defaultModel, setDefaultModel] = useState<string | null>(null);
@@ -104,6 +109,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
     Promise.all([getSettings(), getConfig()])
       .then(([s, cfg]) => {
         if (cancelled) return;
+        setUseSystemProxy(s.use_system_proxy ?? false);
         setProviders(s.llm.providers);
         setDefaultProvider(s.llm.default_provider);
         setDefaultModel(s.llm.default_model);
@@ -385,6 +391,12 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
           >
             WebDav
           </button>
+          <button
+            className={`settings-tab ${tab === "network" ? "active" : ""}`}
+            onClick={() => setTab("network")}
+          >
+            网络
+          </button>
           <span className="bulk-flex" />
           <button className="chat-close" onClick={onClose} title="关闭">
             ×
@@ -444,6 +456,42 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 />
               )}
             </>
+          ) : tab === "network" ? (
+            <div className="provider-card">
+              <h3>网络设置</h3>
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={useSystemProxy}
+                  disabled={networkSaving}
+                  onChange={(event) => {
+                    setUseSystemProxy(event.target.checked);
+                    setNetworkSaved(false);
+                  }}
+                />
+                使用系统代理
+              </label>
+              <p className="form-hint">
+                默认关闭，直接连接网络。开启后使用系统或环境变量配置的代理，适用于封面、在线资料、AI 和 WebDAV。保存后对新请求生效。
+              </p>
+              {networkError && <div className="modal-error">{networkError}</div>}
+              <button className="btn primary" disabled={networkSaving} onClick={async () => {
+                setNetworkSaving(true);
+                setNetworkError(null);
+                setNetworkSaved(false);
+                try {
+                  await saveNetworkSettings(useSystemProxy);
+                  setNetworkSaved(true);
+                } catch (e) {
+                  setNetworkError(String(e));
+                } finally {
+                  setNetworkSaving(false);
+                }
+              }}>
+                {networkSaving ? "保存中…" : "保存网络设置"}
+              </button>
+              {networkSaved && <span className="form-hint"> 已保存</span>}
+            </div>
           ) : tab === "webdav" ? (
             <>
               {/* WebDav 子选项卡：每个已保存书库一页 */}
