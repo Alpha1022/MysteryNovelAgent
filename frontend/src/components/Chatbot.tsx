@@ -192,7 +192,7 @@ function MessageBubble({ m, onRetry, disabled }: { m: ChatMessage; onRetry: () =
 }
 
 export default function Chatbot() {
-  const { confirm, confirmElement } = useConfirm();
+  const { confirm, confirmText, confirmElement } = useConfirm();
   const [open, setOpen] = useState(false);
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
   const [currentId, setCurrentId] = useState<string>(
@@ -270,14 +270,16 @@ export default function Chatbot() {
           return;
         }
         if (action.review) {
-          const ok = action.autoSaveReview || await confirm({
+          const review = action.autoSaveReview ? action.review : await confirmText({
             title: "书虫请求标记已读",
-            message: `书虫想将《${d.title}》标记为已读，并保存以下短评：\n\n${action.review}\n\n确认保存？`,
+            message: `书虫想将《${d.title}》标记为已读，并保存短评。你可以修改下方内容后保存。`,
+            inputLabel: "短评内容",
+            initialValue: action.review,
             okLabel: "标记并保存",
           });
-          if (ok) {
+          if (review !== null) {
             if (d.status !== action.status) await setBookStatus(action.bookId, action.status);
-            await saveBookReview(action.bookId, action.review);
+            await saveBookReview(action.bookId, review);
             setNotice(`《${d.title}》已标记为已读并保存短评`);
             notifyLibraryRefresh();
           }

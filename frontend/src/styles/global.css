@@ -1353,6 +1353,20 @@ a {
   width: 400px;
 }
 
+.confirm-edit-modal {
+  width: 600px;
+}
+
+.confirm-input {
+  display: block;
+  margin-top: 16px;
+}
+
+.confirm-input textarea {
+  min-height: 160px;
+  max-height: 45vh;
+}
+
 .confirm-modal.danger .modal-title {
   color: #d17a6f;
 }
