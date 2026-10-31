@@ -15,7 +15,7 @@ import { readTextFile, writeTextFile } from "../api/picker";
 import { renderMarkdown } from "../utils/markdown";
 import type { BookDetail, ChatMessage, ChatSession, ChatStep } from "../types";
 import EditMetaModal from "./EditMetaModal";
-import ReviewModal, { type ReviewTarget } from "./ReviewModal";
+import { REVIEW_CHAT_EVENT, buildReviewPrompt, startReviewChat, type ReviewTarget } from "../utils/reviewChat";
 import { useConfirm } from "./ConfirmDialog";
 
 /**
@@ -201,8 +201,8 @@ export default function Chatbot() {
   const [actionQueue, setActionQueue] = useState<PendingAction[]>([]);
   /** 元数据编辑弹窗的目标（书虫补丁已应用到 BookDetail 上） */
   const [metaEditBook, setMetaEditBook] = useState<BookDetail | null>(null);
-  /** 苏格拉底式短评生成弹窗目标 */
-  const [reviewTarget, setReviewTarget] = useState<ReviewTarget | null>(null);
+  const [reviewQueue, setReviewQueue] = useState<ReviewTarget[]>([]);
+  const sendingRef = useRef(false);
   const [actionBusy, setActionBusy] = useState(false);
 
   const dequeueAction = () => setActionQueue((q) => q.slice(1));
@@ -213,7 +213,7 @@ export default function Chatbot() {
    * cleanup 若置 cancelled 会把首次执行的出队逻辑吞掉（队列卡死）；
    * processAction 内部自捕获错误，这里 finally 保证必定出队。 */
   useEffect(() => {
-    if (actionQueue.length === 0 || metaEditBook || reviewTarget || actionBusy) return;
+    if (actionQueue.length === 0 || metaEditBook || actionBusy) return;
     const action = actionQueue[0];
     setActionBusy(true);
     void (async () => {
@@ -225,7 +225,7 @@ export default function Chatbot() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actionQueue, metaEditBook, reviewTarget, actionBusy]);
+  }, [actionQueue, metaEditBook, actionBusy]);
 
   /** 执行单个待确认动作：拉取详情 → 按类型弹确认/编辑窗口 */
   const processAction = async (action: PendingAction) => {
@@ -268,23 +268,6 @@ export default function Chatbot() {
             setNotice(`《${d.title}》已标记为已读并保存短评`);
             notifyLibraryRefresh();
           }
-        } else if (action.generateReview) {
-          const ok = await confirm({
-            title: "书虫请求生成短评",
-            message: `书虫想将《${d.title}》标记为已读，并打开 AI 引导式短评生成窗口。\n确认？`,
-            okLabel: "打开短评窗口",
-          });
-          if (ok) {
-            await setBookStatus(action.bookId, action.status);
-            setReviewTarget({
-              id: d.id,
-              title: d.title,
-              author: d.author,
-              tags: d.tags,
-            });
-            // 弹窗关闭时由 onClose 负责出队
-            return;
-          }
         } else {
           const ok = await confirm({
             title: "书虫请求切换阅读状态",
@@ -295,6 +278,7 @@ export default function Chatbot() {
             await setBookStatus(action.bookId, action.status);
             setNotice(`《${d.title}》已标记为「${action.status}」`);
             notifyLibraryRefresh();
+            if (action.status === "已读") startReviewChat(d);
           }
         }
         return;
@@ -370,11 +354,12 @@ export default function Chatbot() {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [current?.messages, busy, showHistory, liveSteps.length]);
 
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
+  const send = async (message = input.trim(), session?: ChatSession) => {
+    const text = message;
+    if (!text || sendingRef.current) return;
+    sendingRef.current = true;
     // 无会话时先创建（保证后续回复写入同一会话）
-    let base = current;
+    let base = session ?? current;
     if (!base) {
       base = newSession();
       setSessions((prev) => {
@@ -393,7 +378,7 @@ export default function Chatbot() {
       ...s,
       messages: next,
       // 标题取首条用户消息
-      title: s.messages.length === 0 ? text.slice(0, 24) : s.title,
+      title: s.messages.length === 0 && !session ? text.slice(0, 24) : s.title,
       savedAt: Date.now(),
     }));
     setInput("");
@@ -432,9 +417,38 @@ export default function Chatbot() {
       }
     } finally {
       setLiveSteps([]);
+      sendingRef.current = false;
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    const onReview = (event: Event) => {
+      const target = (event as CustomEvent<ReviewTarget>).detail;
+      setReviewQueue((queue) => [...queue, target]);
+      setOpen(true);
+    };
+    window.addEventListener(REVIEW_CHAT_EVENT, onReview);
+    return () => window.removeEventListener(REVIEW_CHAT_EVENT, onReview);
+  }, []);
+
+  // 等待当前回复及写操作处理完毕，自动消息始终写入新会话。
+  useEffect(() => {
+    if (!reviewQueue.length || busy || sendingRef.current || actionBusy || actionQueue.length || metaEditBook) return;
+    const target = reviewQueue[0];
+    const session = { ...newSession(), title: `读后讨论 · ${target.title}` };
+    setReviewQueue((queue) => queue.slice(1));
+    setSessions((prev) => {
+      const list = [session, ...prev];
+      saveSessions(list);
+      return list;
+    });
+    setCurrentId(session.id);
+    setShowHistory(false);
+    setOpen(true);
+    void send(buildReviewPrompt(target), session);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewQueue, busy, actionBusy, actionQueue, metaEditBook]);
 
   /** 打断书虫的思考过程（中止进行中的 LLM 请求与后续工具调用） */
   const onChatCancel = () => {
@@ -688,15 +702,6 @@ export default function Chatbot() {
           onClose={(changed) => {
             setMetaEditBook(null);
             // changed=true：封面已上传更新，刷新书架
-            if (changed) notifyLibraryRefresh();
-          }}
-        />
-      )}
-      {reviewTarget && (
-        <ReviewModal
-          target={reviewTarget}
-          onClose={(changed) => {
-            setReviewTarget(null);
             if (changed) notifyLibraryRefresh();
           }}
         />

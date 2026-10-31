@@ -2731,7 +2731,8 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
 你也可以代用户发起写操作（修改元数据 / 切换阅读状态 / 合并书籍）：\n\
 - update_book_meta：修改元数据（只传需要改的字段）\n\
 - set_book_status：切换阅读状态；标记已读可携带双方交流总结出的短评，\
-或请求打开 AI 引导式短评生成窗口\n\
+只有用户明确要求生成书评时才生成，明确要求保存时才携带 review 请求保存；不要将结束聊天视为生成或保存授权。\n\
+或请求在书虫中新建读后讨论会话（由用户决定何时生成书评）\n\
 - merge_books：把多本（上下册/系列）按顺序合并为合集\n\
 写操作不会直接生效——应用会弹出确认或编辑窗口，由用户最终确认。\
 调用后请告知用户「已在界面弹出窗口，请在窗口中确认」，不要声称已完成修改。\n\n\
@@ -2885,14 +2886,14 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "set_book_status",
-        "description": "修改某本书的阅读状态（想读/在读/已读）。不直接生效：会弹出确认窗口由用户确认。标记已读时可选携带短评（与用户交流总结得到的），或请求打开 AI 引导式短评生成窗口。",
+        "description": "修改某本书的阅读状态（想读/在读/已读）。不直接生效：会弹出确认窗口由用户确认。标记已读时可选携带短评（与用户交流总结得到的），或请求在书虫中新建读后讨论会话（由用户决定何时生成书评）。",
         "parameters": {
           "type": "object",
           "properties": {
             "book_id": { "type": "integer", "description": "书籍 ID" },
             "status": { "type": "string", "description": "目标状态：想读 / 在读 / 已读" },
             "review": { "type": "string", "description": "短评内容（仅状态为已读时有意义；来自与用户的交流，需用户确认后保存）" },
-            "generate_review": { "type": "boolean", "description": "true = 打开 AI 引导式短评生成窗口（与 review 互斥；仅已读状态有意义）" }
+            "generate_review": { "type": "boolean", "description": "true = 在书虫中新建读后讨论会话（由用户决定何时生成书评）（与 review 互斥；仅已读状态有意义）" }
           },
           "required": ["book_id", "status"]
         }
@@ -3134,7 +3135,7 @@ fn execute_chatbot_tool(
         return err("review / generate_review 仅在标记「已读」时有效".into());
       }
       if review.is_some() && generate {
-        return err("review 与 generate_review 互斥：要么直接携带短评，要么打开 AI 生成窗口".into());
+        return err("review 与 generate_review 互斥：要么直接携带短评，要么启动书虫读后讨论".into());
       }
       match db::get_book_detail(conn, id) {
         Ok(Some(d)) => serde_json::json!({

@@ -16,7 +16,8 @@ import CommentItem, { type CommentSourceInfo } from "../components/CommentItem";
 import StateView from "../components/StateView";
 import EditMetaModal, { type MetaEditParams } from "../components/EditMetaModal";
 import ReaderModal from "../components/ReaderModal";
-import ReviewModal, { ReviewEditModal, type ReviewTarget } from "../components/ReviewModal";
+import { ReviewEditModal } from "../components/ReviewModal";
+import { startReviewChat } from "../utils/reviewChat";
 import StatusBadge from "../components/StatusBadge";
 import SourcesModal from "../components/SourcesModal";
 import { useConfirm } from "../components/ConfirmDialog";
@@ -38,7 +39,6 @@ export default function BookDetailPage() {
   const [readerOpen, setReaderOpen] = useState(false);
   const [metaError, setMetaError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [reviewTarget, setReviewTarget] = useState<ReviewTarget | null>(null);
   const [reviewEditing, setReviewEditing] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [llmReady, setLlmReady] = useState<boolean | null>(null);
@@ -48,6 +48,12 @@ export default function BookDetailPage() {
       .then((s) => setLlmReady(s.configured))
       .catch(() => setLlmReady(false));
   }, [refresh]);
+
+  useEffect(() => {
+    const refreshLibrary = () => setRefresh((n) => n + 1);
+    window.addEventListener("mna:library-refresh", refreshLibrary);
+    return () => window.removeEventListener("mna:library-refresh", refreshLibrary);
+  }, []);
 
   // 来源项目映射（短评悬停展示来源封面与书名）
   const [sourceMap, setSourceMap] = useState<Map<string, CommentSourceInfo>>(new Map());
@@ -99,7 +105,7 @@ export default function BookDetailPage() {
     };
   }, [bookId, refresh]);
 
-  /** 切换阅读状态；切到"已读"时弹出短评询问 */
+  /** 切换阅读状态；切到"已读"时启动书虫读后讨论 */
   const onStatusChange = async (newStatus: string) => {
     if (!book) return;
     setActionError(null);
@@ -107,7 +113,7 @@ export default function BookDetailPage() {
       await setBookStatus(book.id, newStatus);
       setBook({ ...book, status: newStatus });
       if (newStatus === "已读") {
-        setReviewTarget({
+        startReviewChat({
           id: book.id,
           title: book.title,
           author: book.author,
@@ -339,15 +345,6 @@ export default function BookDetailPage() {
         />
       )}
 
-      {reviewTarget && (
-        <ReviewModal
-          target={reviewTarget}
-          onClose={(changed) => {
-            setReviewTarget(null);
-            if (changed) setRefresh((k) => k + 1);
-          }}
-        />
-      )}
 
       {reviewEditing && (
         <ReviewEditModal

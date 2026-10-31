@@ -27,7 +27,7 @@ import AddBookModal, { ensureMysteryTag } from "../components/AddBookModal";
 import FilterSidebar, { type FilterGroup } from "../components/FilterSidebar";
 import { applyTheme } from "../theme";
 import SettingsModal from "../components/SettingsModal";
-import ReviewModal, { type ReviewTarget } from "../components/ReviewModal";
+import { startReviewChat } from "../utils/reviewChat";
 import { useConfirm } from "../components/ConfirmDialog";
 
 /** 批量模式中等待用户确认的一本书（Promise 挂起，弹窗回调解锁） */
@@ -266,8 +266,6 @@ export default function LibraryPage() {
   // LLM 可用性（合并本简介预检；null = 检测中）
   const [llmReady, setLlmReady] = useState<boolean | null>(null);
 
-  // 阅读状态切换 → 已读短评弹窗
-  const [reviewTarget, setReviewTarget] = useState<ReviewTarget | null>(null);
 
   // 排序 / 多选批量操作（排序偏好持久化，重新进入页面时维持上次选项）
   const [sortKey, setSortKey] = useState<SortKey>(loadSortPref);
@@ -996,14 +994,14 @@ export default function LibraryPage() {
     setPending(null);
   };
 
-  /** 切换阅读状态；切到"已读"时弹出短评询问 */
+  /** 切换阅读状态；切到"已读"时启动书虫读后讨论 */
   const handleStatusChange = (id: number, newStatus: string, title: string) => {
     setBookStatus(id, newStatus)
       .then(() => {
         setBooks((prev) => prev.map((b) => (b.id === id ? { ...b, status: newStatus } : b)));
         if (newStatus === "已读") {
           const b = books.find((x) => x.id === id);
-          setReviewTarget({
+          startReviewChat({
             id,
             title,
             author: b?.author ?? "",
@@ -1091,7 +1089,7 @@ export default function LibraryPage() {
     }
   };
 
-  /** 批量标记阅读状态（直接入库，不弹短评询问） */
+  /** 批量标记阅读状态（仅更新状态） */
   const bulkSetStatus = async (s: string) => {
     if (selected.size === 0 || bulkBusy) return;
     setBulkBusy(true);
@@ -1343,7 +1341,7 @@ export default function LibraryPage() {
                 className="btn small"
                 onClick={() => bulkSetStatus("想读")}
                 disabled={bulkBusy || selected.size === 0}
-                title="批量标记不会弹出短评询问"
+                title="批量标记仅更新阅读状态"
               >
                 设为想读
               </button>
@@ -1351,7 +1349,7 @@ export default function LibraryPage() {
                 className="btn small"
                 onClick={() => bulkSetStatus("在读")}
                 disabled={bulkBusy || selected.size === 0}
-                title="批量标记不会弹出短评询问"
+                title="批量标记仅更新阅读状态"
               >
                 设为在读
               </button>
@@ -1359,7 +1357,7 @@ export default function LibraryPage() {
                 className="btn small"
                 onClick={() => bulkSetStatus("已读")}
                 disabled={bulkBusy || selected.size === 0}
-                title="批量标记不会弹出短评询问"
+                title="批量标记仅更新阅读状态"
               >
                 设为已读
               </button>
@@ -1489,15 +1487,6 @@ export default function LibraryPage() {
         />
       )}
 
-      {reviewTarget && (
-        <ReviewModal
-          target={reviewTarget}
-          onClose={(changed) => {
-            setReviewTarget(null);
-            if (changed) setRefresh((k) => k + 1);
-          }}
-        />
-      )}
       {settingsOpen && (
         <SettingsModal
           onClose={() => {
