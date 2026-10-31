@@ -293,6 +293,8 @@ export interface ChatReply {
 
 /** 书虫会话（多轮对话历史；可导出/导入 JSON） */
 export interface ChatSession {
+  /** 用户确认开启的读后讨论，生成书评时可直接保存到此书。 */
+  reviewBookId?: number;
   id: string;
   /** 标题（取首条用户消息） */
   title: string;

@@ -76,6 +76,8 @@ pub async fn execute(name: &str, args: &Value) -> String {
 
 async fn execute_inner(name: &str, args: &Value) -> anyhow::Result<Value> {
   let client = reqwest::Client::builder()
+    // 豆瓣公开接口直接访问，避免继承已关闭的系统/环境代理导致 CONNECT 失败。
+    .no_proxy()
     .timeout(std::time::Duration::from_secs(15))
     .build()?;
   if name == "get_douban_review_full" {

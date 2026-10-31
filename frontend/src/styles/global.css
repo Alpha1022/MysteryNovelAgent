@@ -3804,3 +3804,25 @@ a {
     right: 8px;
   }
 }
+
+/* 消息左侧的重发入口；键盘聚焦和触屏也可访问。 */
+.chat-retry {
+  flex: 0 0 24px;
+  align-self: flex-start;
+  margin: 7px 4px 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.chat-msg:hover .chat-retry,
+.chat-msg:focus-within .chat-retry { opacity: 1; }
+.chat-retry:disabled { cursor: not-allowed; }
+.chat-retry:hover:not(:disabled) { color: var(--accent); }
+@media (hover: none) {
+  .chat-retry { opacity: 1; }
+}

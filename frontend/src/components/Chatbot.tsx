@@ -16,6 +16,7 @@ import { renderMarkdown } from "../utils/markdown";
 import type { BookDetail, ChatMessage, ChatSession, ChatStep } from "../types";
 import EditMetaModal from "./EditMetaModal";
 import { REVIEW_CHAT_EVENT, buildReviewPrompt, startReviewChat, type ReviewTarget } from "../utils/reviewChat";
+import { prepareRetry, canSaveReview } from "../utils/chatRetry";
 import { useConfirm } from "./ConfirmDialog";
 
 /**
@@ -50,6 +51,7 @@ type PendingAction =
       status: string;
       review?: string;
       generateReview?: boolean;
+      autoSaveReview?: boolean;
     }
   | { kind: "merge"; ids: number[] };
 
@@ -163,10 +165,19 @@ function StepsList({ steps }: { steps: ChatStep[] }) {
 }
 
 /** 单条消息气泡（assistant 附带工具轨迹 + Markdown 渲染） */
-function MessageBubble({ m }: { m: ChatMessage }) {
+function MessageBubble({ m, onRetry, disabled }: { m: ChatMessage; onRetry: () => void; disabled: boolean }) {
   const steps = m.role === "assistant" ? (m.steps ?? []) : [];
   return (
     <div className={`chat-msg ${m.role}`}>
+      <button
+        className="chat-retry"
+        title={m.role === "user" ? "重新发送，并清理后续消息" : "重新生成，并清理后续消息"}
+        aria-label={m.role === "user" ? "重新发送此条消息" : "重新生成此条回复"}
+        disabled={disabled}
+        onClick={onRetry}
+      >
+        ↻
+      </button>
       <div className="chat-bubble">
         {steps.length > 0 && <StepsList steps={steps} />}
         <div
@@ -203,6 +214,8 @@ export default function Chatbot() {
   const [metaEditBook, setMetaEditBook] = useState<BookDetail | null>(null);
   const [reviewQueue, setReviewQueue] = useState<ReviewTarget[]>([]);
   const sendingRef = useRef(false);
+  const reviewStartingRef = useRef(false);
+  const [reviewStarting, setReviewStarting] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
 
   const dequeueAction = () => setActionQueue((q) => q.slice(1));
@@ -213,7 +226,7 @@ export default function Chatbot() {
    * cleanup 若置 cancelled 会把首次执行的出队逻辑吞掉（队列卡死）；
    * processAction 内部自捕获错误，这里 finally 保证必定出队。 */
   useEffect(() => {
-    if (actionQueue.length === 0 || metaEditBook || actionBusy) return;
+    if (actionQueue.length === 0 || metaEditBook || actionBusy || reviewStarting) return;
     const action = actionQueue[0];
     setActionBusy(true);
     void (async () => {
@@ -225,7 +238,7 @@ export default function Chatbot() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actionQueue, metaEditBook, actionBusy]);
+  }, [actionQueue, metaEditBook, actionBusy, reviewStarting]);
 
   /** 执行单个待确认动作：拉取详情 → 按类型弹确认/编辑窗口 */
   const processAction = async (action: PendingAction) => {
@@ -257,13 +270,13 @@ export default function Chatbot() {
           return;
         }
         if (action.review) {
-          const ok = await confirm({
+          const ok = action.autoSaveReview || await confirm({
             title: "书虫请求标记已读",
             message: `书虫想将《${d.title}》标记为已读，并保存以下短评：\n\n${action.review}\n\n确认保存？`,
             okLabel: "标记并保存",
           });
           if (ok) {
-            await setBookStatus(action.bookId, action.status);
+            if (d.status !== action.status) await setBookStatus(action.bookId, action.status);
             await saveBookReview(action.bookId, action.review);
             setNotice(`《${d.title}》已标记为已读并保存短评`);
             notifyLibraryRefresh();
@@ -407,7 +420,11 @@ export default function Chatbot() {
       }));
       // 写操作工具：从轨迹中提取待确认动作，弹窗确认后生效
       const acts = collectActions(res.steps ?? []);
-      if (acts.length > 0) setActionQueue((q) => [...q, ...acts]);
+      if (acts.length > 0) setActionQueue((q) => [...q, ...acts.map((action) =>
+        action.kind === "status"
+          ? { ...action, autoSaveReview: canSaveReview(base.reviewBookId, action.bookId, action.status) }
+          : action,
+      )]);
     } catch (e) {
       // 打断不算错误：给出友好提示
       if (String(e).includes("已取消") || String(e).includes("任务已取消")) {
@@ -426,29 +443,55 @@ export default function Chatbot() {
     const onReview = (event: Event) => {
       const target = (event as CustomEvent<ReviewTarget>).detail;
       setReviewQueue((queue) => [...queue, target]);
-      setOpen(true);
     };
     window.addEventListener(REVIEW_CHAT_EVENT, onReview);
     return () => window.removeEventListener(REVIEW_CHAT_EVENT, onReview);
   }, []);
 
-  // 等待当前回复及写操作处理完毕，自动消息始终写入新会话。
+  // 确认后才创建新会话；取消不影响已更新的阅读状态。
   useEffect(() => {
-    if (!reviewQueue.length || busy || sendingRef.current || actionBusy || actionQueue.length || metaEditBook) return;
+    if (!reviewQueue.length || busy || sendingRef.current || actionBusy || actionQueue.length || metaEditBook || reviewStartingRef.current) return;
+    reviewStartingRef.current = true;
+    setReviewStarting(true);
     const target = reviewQueue[0];
-    const session = { ...newSession(), title: `读后讨论 · ${target.title}` };
-    setReviewQueue((queue) => queue.slice(1));
-    setSessions((prev) => {
-      const list = [session, ...prev];
-      saveSessions(list);
-      return list;
-    });
-    setCurrentId(session.id);
-    setShowHistory(false);
-    setOpen(true);
-    void send(buildReviewPrompt(target), session);
+    void (async () => {
+      try {
+        const ok = await confirm({
+          title: "读后书评",
+          message: `是否通过书虫对话，为《${target.title}》生成书评？\n在对话中告诉书虫“生成书评”，书虫就会根据讨论生成书评，并保存到这本书中。`,
+          okLabel: "开始对话",
+          cancelLabel: "暂不",
+        });
+        if (!ok) return;
+        const session: ChatSession = {
+          ...newSession(), title: `读后讨论 · ${target.title}`, reviewBookId: target.id,
+        };
+        setSessions((prev) => {
+          const list = [session, ...prev];
+          saveSessions(list);
+          return list;
+        });
+        setCurrentId(session.id);
+        setShowHistory(false);
+        setOpen(true);
+        void send(buildReviewPrompt(target), session);
+      } finally {
+        setReviewQueue((queue) => queue.slice(1));
+        reviewStartingRef.current = false;
+        setReviewStarting(false);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewQueue, busy, actionBusy, actionQueue, metaEditBook]);
+
+  const retryBlocked = busy || actionBusy || actionQueue.length > 0 || !!metaEditBook || reviewStarting;
+  const retry = (index: number) => {
+    if (!current || retryBlocked || sendingRef.current) return;
+    const request = prepareRetry(current.messages, index);
+    if (!request) return;
+    // send 立即持久化截断后的历史，失败时仍保留原用户消息以便再次重试。
+    void send(request.text, { ...current, messages: request.history });
+  };
 
   /** 打断书虫的思考过程（中止进行中的 LLM 请求与后续工具调用） */
   const onChatCancel = () => {
@@ -520,6 +563,8 @@ export default function Chatbot() {
       const session: ChatSession = {
         ...newSession(),
         ...s,
+        // 导入的会话不能继承本机确认过的直接保存权限。
+        reviewBookId: undefined,
         id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       };
       setSessions((prev) => {
@@ -611,7 +656,7 @@ export default function Chatbot() {
               </div>
             )}
             {messages.map((m, i) => (
-              <MessageBubble key={i} m={m} />
+              <MessageBubble key={i} m={m} onRetry={() => retry(i)} disabled={retryBlocked || !prepareRetry(messages, i)} />
             ))}
             {busy && (
               <div className="chat-msg assistant">
