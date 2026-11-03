@@ -435,14 +435,14 @@ export function refreshSourceComments(
   return invoke("refresh_source_comments", { bookId, kind, refKey });
 }
 
-/** 将来源项目封面设为本书封面（clasp 项目可传版本封面本地路径） */
+/** 将来源项目封面设为本书封面（clasp 项目可传版本封面 URL） */
 export function setSourceAsCover(
   bookId: number,
   kind: string,
   refKey: string,
-  editionPath?: string,
+  editionUrl?: string,
 ): Promise<{ cover_path: string }> {
-  return invoke("set_source_as_cover", { bookId, kind, refKey, editionPath });
+  return invoke("set_source_as_cover", { bookId, kind, refKey, editionUrl });
 }
 
 /** 将来源项目简介设为本书简介 */

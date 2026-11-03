@@ -204,9 +204,9 @@ export default function SourcesModal({ bookId, bookTitle, onClose }: Props) {
       setNotice(`已重抓 ${n} 条短评`);
     });
 
-  const onSetCover = (s: SourceItem, editionPath?: string) =>
-    run(`cv-${s.ref_key}-${editionPath ?? ""}`, async () => {
-      const res = await setSourceAsCover(bookId, s.kind, s.ref_key, editionPath);
+  const onSetCover = (s: SourceItem, editionUrl?: string) =>
+    run(`cv-${s.ref_key}-${editionUrl ?? ""}`, async () => {
+      const res = await setSourceAsCover(bookId, s.kind, s.ref_key, editionUrl);
       changedRef.current = true;
       setExpanded(null);
       setNotice(`封面已更新：${res.cover_path.split(/[\\/]/).pop() ?? ""}`);
