@@ -147,12 +147,14 @@ export default function AddBookModal({
     }
     const authors: string[] = [];
     for (const m of selected) {
-      const a = m.author.trim();
-      if (a && !authors.includes(a)) authors.push(a);
+      for (const name of m.author.split(" / ")) {
+        const a = name.trim();
+        if (a && !authors.includes(a)) authors.push(a);
+      }
     }
     return {
       title: first?.title.trim() || preview.title.trim(),
-      author: authors.join("、") || preview.author.trim(),
+      author: authors.join(" / ") || preview.author.trim(),
       tags: first ? ensureMysteryTag(tagUnion, defaultTags) : [],
     };
   };

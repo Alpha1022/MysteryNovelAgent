@@ -1754,11 +1754,8 @@ pub async fn crawl_clasp_source(client: &reqwest::Client, id: &str) -> PendingSo
   };
 
   ps.title = detail.title.clone().filter(|s| !s.trim().is_empty());
-  ps.author = detail
-    .author
-    .as_ref()
-    .map(|a| a.name.trim().to_string())
-    .filter(|s| !s.is_empty());
+  let author = detail.author_name();
+  ps.author = (!author.is_empty()).then_some(author);
   ps.summary = detail
     .summary_no_spoiler
     .clone()
@@ -2332,9 +2329,10 @@ pub fn crawled_title_author(
 
   let mut authors: Vec<String> = Vec::new();
   let push_author = |a: &str, out: &mut Vec<String>| {
-    let a = a.trim();
-    if !a.is_empty() && !out.iter().any(|x| x == a) {
-      out.push(a.to_string());
+    for a in a.split(" / ").map(str::trim) {
+      if !a.is_empty() && !out.iter().any(|x| x == a) {
+        out.push(a.to_string());
+      }
     }
   };
   for s in clasp_sources {
@@ -2358,7 +2356,7 @@ pub fn crawled_title_author(
   let author = if authors.is_empty() {
     current_author.to_string()
   } else {
-    authors.join("、")
+    authors.join(" / ")
   };
   (title, author)
 }
@@ -2918,7 +2916,7 @@ mod tests {
     assert_eq!(t, "钟表馆事件");
     assert_eq!(a, "綾辻行人");
 
-    // 合并本：作者取 clasp 来源并集（顿号拼接、去重）
+    // 合并本：作者取 clasp 来源并集（斜杠拼接、按作者去重）
     let (t, a) = crawled_title_author(
       "",
       "",
@@ -2934,11 +2932,11 @@ mod tests {
       "EPUB标题",
       "EPUB作者",
       &[clasp(None, None)],
-      &[&m("搜索标题", "作者甲"), &m("搜索标题2", "作者乙")],
+      &[&m("搜索标题", "作者甲 / 作者乙"), &m("搜索标题2", "作者乙")],
       &[],
     );
     assert_eq!(t, "搜索标题");
-    assert_eq!(a, "作者甲、作者乙");
+    assert_eq!(a, "作者甲 / 作者乙");
 
     // 无 clasp 匹配（跳过搜索走豆瓣）：豆瓣首来源覆盖
     let (t, a) = crawled_title_author(

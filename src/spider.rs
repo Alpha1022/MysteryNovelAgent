@@ -116,6 +116,25 @@ pub struct ClaspTag {
   pub name: String,
 }
 
+fn clasp_author_name(authors: &[ClaspAuthor], primary: Option<&ClaspAuthor>) -> String {
+  let mut names = Vec::new();
+  for author in authors {
+    let name = author.name.trim();
+    if !name.is_empty() && !names.contains(&name) {
+      names.push(name);
+    }
+  }
+  if names.is_empty() {
+    if let Some(author) = primary {
+      let name = author.name.trim();
+      if !name.is_empty() {
+        names.push(name);
+      }
+    }
+  }
+  names.join(" / ")
+}
+
 /// 分页搜索返回的单本书（携带无剧透简介，可省去详情 API 调用）
 /// 注意：该接口不返回系列信息（series 仍需详情 API 或放弃）
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -126,7 +145,7 @@ pub struct ClaspBookItem {
   /// 主要作者（部分条目仅此字段）
   #[serde(rename = "author", default)]
   pub author: Option<ClaspAuthor>,
-  /// 作者列表（常规来源，取第一个）
+  /// 作者列表（按接口顺序保留全部作者）
   #[serde(default)]
   pub authors: Vec<ClaspAuthor>,
   #[serde(rename = "coverUrl", default)]
@@ -140,21 +159,9 @@ pub struct ClaspBookItem {
 }
 
 impl ClaspBookItem {
-  /// 作者名：authors[0] 优先，author 兜底
+  /// 按接口顺序合并所有作者，空列表回退主要作者。
   pub fn author_name(&self) -> String {
-    self
-      .authors
-      .first()
-      .map(|a| a.name.trim().to_string())
-      .filter(|s| !s.is_empty())
-      .or_else(|| {
-        self
-          .author
-          .as_ref()
-          .map(|a| a.name.trim().to_string())
-          .filter(|s| !s.is_empty())
-      })
-      .unwrap_or_default()
+    clasp_author_name(&self.authors, self.author.as_ref())
   }
 
   /// 标签名列表
@@ -414,6 +421,9 @@ pub struct ClaspBookDetail {
   pub title: Option<String>,
   #[serde(default)]
   pub author: Option<ClaspAuthor>,
+  /// 完整作者列表，缺失时兼容旧版 author 字段。
+  #[serde(default)]
+  pub authors: Vec<ClaspAuthor>,
   #[serde(default)]
   pub tags: Vec<ClaspTag>,
   #[serde(rename = "summaryNoSpoiler", default)]
@@ -502,6 +512,11 @@ pub struct ClaspImprint {
 }
 
 impl ClaspBookDetail {
+  /// 按接口顺序合并所有作者，空列表回退主要作者。
+  pub fn author_name(&self) -> String {
+    clasp_author_name(&self.authors, self.author.as_ref())
+  }
+
   /// 取主版本的豆瓣链接，兜底取第一个有豆瓣链接的版本
   pub fn primary_douban_url(&self) -> Option<String> {
     self
@@ -563,15 +578,16 @@ impl ClaspBookMeta {
     let title = items.first().map(|s| s.title.clone()).unwrap_or_default();
     let mut authors: Vec<String> = Vec::new();
     for s in items {
-      let a = s.author_name.trim();
-      if !a.is_empty() && !authors.iter().any(|x| x == a) {
-        authors.push(a.to_string());
+      for a in s.author_name.split(" / ").map(str::trim) {
+        if !a.is_empty() && !authors.iter().any(|x| x == a) {
+          authors.push(a.to_string());
+        }
       }
     }
 
     ClaspBookMeta {
       title,
-      author: authors.join("、"),
+      author: authors.join(" / "),
       tags,
       clasp_ids,
       douban_urls,
@@ -926,6 +942,26 @@ pub async fn fetch_clasp_reviews(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn clasp_multiple_authors_and_legacy_fallback() {
+    for (fields, expected) in [
+      (r#""authors":[{"name":" 三津田信三 "},{"name":""},{"name":"薛西斯"},{"name":"三津田信三"}],"author":{"name":"旧作者"}"#, "三津田信三 / 薛西斯"),
+      (r#""authors":[],"author":{"name":" 旧作者 "}"#, "旧作者"),
+      (r#""authors":[{"name":" "}],"author":{"name":"旧作者"}"#, "旧作者"),
+      (r#""author":{"name":"旧作者"}"#, "旧作者"),
+      (r#""authors":[]"#, ""),
+    ] {
+      let json = format!(r#"{{"id":"test",{fields}}}"#);
+      let item: ClaspBookItem = serde_json::from_str(&json).unwrap();
+      let detail: ClaspBookDetail = serde_json::from_str(&json).unwrap();
+      assert_eq!(item.author_name(), expected);
+      assert_eq!(detail.author_name(), expected);
+      let suggestion = ClaspBookSuggestion::from(&item);
+      let meta = ClaspBookMeta::from_suggestions(&[suggestion.clone(), suggestion]);
+      assert_eq!(meta.author, expected);
+    }
+  }
 
   #[test]
   fn online_douban_parsers_preserve_metadata_and_reject_unknown_pages() {
