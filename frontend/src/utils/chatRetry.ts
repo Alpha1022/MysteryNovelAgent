@@ -10,8 +10,3 @@ export function prepareRetry(messages: ChatMessage[], index: number): { history:
   if (userIndex < 0 || messages[userIndex].role !== "user") return null;
   return { history: messages.slice(0, userIndex), text: messages[userIndex].content };
 }
-
-/** 仅确认开启的读后会话可直接保存对应书籍的书评。 */
-export function canSaveReview(reviewBookId: number | undefined, bookId: number, status: string): boolean {
-  return reviewBookId === bookId && status === "已读";
-}

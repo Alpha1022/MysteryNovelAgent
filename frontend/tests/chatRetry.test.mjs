@@ -7,7 +7,7 @@ const { outputText } = ts.transpileModule(
   readFileSync(new URL("../src/utils/chatRetry.ts", import.meta.url), "utf8"),
   { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2021 } },
 );
-const { prepareRetry, canSaveReview } = await import(
+const { prepareRetry } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 const messages = [
@@ -40,11 +40,4 @@ test("不完整或非法历史不会发起错误请求", () => {
   assert.equal(prepareRetry(messages, 1.5), null);
   assert.equal(prepareRetry(messages, 99), null);
   assert.equal(prepareRetry([{ role: "assistant", content: "导入的孤立回复" }], 0), null);
-});
-
-test("直接保存授权只适用于确认过的目标书，普通会话和其他书仍须确认", () => {
-  assert.equal(canSaveReview(42, 42, "已读"), true);
-  assert.equal(canSaveReview(undefined, 42, "已读"), false);
-  assert.equal(canSaveReview(42, 43, "已读"), false);
-  assert.equal(canSaveReview(42, 42, "想读"), false);
 });

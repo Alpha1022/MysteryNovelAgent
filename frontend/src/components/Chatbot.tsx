@@ -13,10 +13,14 @@ import {
 } from "../api/tauri";
 import { readTextFile, writeTextFile } from "../api/picker";
 import { renderMarkdown } from "../utils/markdown";
+import { collectActions, type PendingAction } from "../utils/chatActions";
 import type { BookDetail, ChatMessage, ChatSession, ChatStep } from "../types";
 import EditMetaModal from "./EditMetaModal";
-import { REVIEW_CHAT_EVENT, buildReviewPrompt, startReviewChat, type ReviewTarget } from "../utils/reviewChat";
-import { prepareRetry, canSaveReview } from "../utils/chatRetry";
+import {
+  REVIEW_CHAT_EVENT, buildReviewPrompt, isReviewDraftCommand, prepareReviewReply, startReviewChat,
+  type ReviewTarget,
+} from "../utils/reviewChat";
+import { prepareRetry } from "../utils/chatRetry";
 import { useConfirm } from "./ConfirmDialog";
 
 /**
@@ -30,84 +34,6 @@ import { useConfirm } from "./ConfirmDialog";
 
 const SESSIONS_KEY = "mna-chat-sessions";
 const CURRENT_KEY = "mna-chat-current";
-
-/** 书虫发起的待确认写操作（从回复的工具轨迹中解析） */
-type PendingAction =
-  | {
-      kind: "meta";
-      bookId: number;
-      patch: {
-        title?: string;
-        author?: string;
-        tags?: string;
-        description?: string;
-        seriesName?: string;
-        seriesOrder?: number;
-      };
-    }
-  | {
-      kind: "status";
-      bookId: number;
-      status: string;
-      review?: string;
-      generateReview?: boolean;
-      autoSaveReview?: boolean;
-    }
-  | { kind: "merge"; ids: number[] };
-
-/** 从工具轨迹中提取写操作（去重；顺序保持调用次序） */
-function collectActions(steps: ChatStep[]): PendingAction[] {
-  const actions: PendingAction[] = [];
-  const seen = new Set<string>();
-  for (const s of steps) {
-    let args: Record<string, unknown> = {};
-    try {
-      args = JSON.parse(s.args) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const bookId = typeof args.book_id === "number" ? args.book_id : null;
-    const str = (k: string) =>
-      typeof args[k] === "string" && (args[k] as string).trim() ? (args[k] as string) : undefined;
-    const num = (k: string) => (typeof args[k] === "number" ? (args[k] as number) : undefined);
-    let action: PendingAction | null = null;
-    if (s.tool === "update_book_meta" && bookId != null) {
-      action = {
-        kind: "meta",
-        bookId,
-        patch: {
-          title: str("title"),
-          author: str("author"),
-          tags: str("tags"),
-          description: str("description"),
-          seriesName: str("series_name"),
-          seriesOrder: num("series_order"),
-        },
-      };
-    } else if (s.tool === "set_book_status" && bookId != null) {
-      action = {
-        kind: "status",
-        bookId,
-        status: String(args.status ?? ""),
-        review: str("review"),
-        generateReview: args.generate_review === true,
-      };
-    } else if (s.tool === "merge_books" && Array.isArray(args.book_ids)) {
-      const ids = (args.book_ids as unknown[]).filter(
-        (v): v is number => typeof v === "number",
-      );
-      if (ids.length >= 2) action = { kind: "merge", ids };
-    }
-    if (action) {
-      const key = JSON.stringify(action);
-      if (!seen.has(key)) {
-        seen.add(key);
-        actions.push(action);
-      }
-    }
-  }
-  return actions;
-}
 
 /** 通知书架刷新（书虫写操作完成后广播） */
 const notifyLibraryRefresh = () =>
@@ -165,7 +91,9 @@ function StepsList({ steps }: { steps: ChatStep[] }) {
 }
 
 /** 单条消息气泡（assistant 附带工具轨迹 + Markdown 渲染） */
-function MessageBubble({ m, onRetry, disabled }: { m: ChatMessage; onRetry: () => void; disabled: boolean }) {
+function MessageBubble({ m, onRetry, disabled }: {
+  m: ChatMessage; onRetry?: () => void; disabled: boolean;
+}) {
   const steps = m.role === "assistant" ? (m.steps ?? []) : [];
   return (
     <div className={`chat-msg ${m.role}`}>
@@ -173,7 +101,7 @@ function MessageBubble({ m, onRetry, disabled }: { m: ChatMessage; onRetry: () =
         className="chat-retry"
         title={m.role === "user" ? "重新发送，并清理后续消息" : "重新生成，并清理后续消息"}
         aria-label={m.role === "user" ? "重新发送此条消息" : "重新生成此条回复"}
-        disabled={disabled}
+        disabled={disabled || !onRetry}
         onClick={onRetry}
       >
         ↻
@@ -270,18 +198,19 @@ export default function Chatbot() {
           return;
         }
         if (action.review) {
-          const review = action.autoSaveReview ? action.review : await confirmText({
-            title: "书虫请求标记已读",
-            message: `书虫想将《${d.title}》标记为已读，并保存短评。你可以修改下方内容后保存。`,
+          const review = await confirmText({
+            title: "编辑短评",
+            message: d.status === "已读" ? `《${d.title}》` : `保存短评时将《${d.title}》标记为已读。`,
             inputLabel: "短评内容",
             initialValue: action.review,
-            okLabel: "标记并保存",
+            okLabel: "保存短评",
           });
           if (review !== null) {
-            if (d.status !== action.status) await setBookStatus(action.bookId, action.status);
-            await saveBookReview(action.bookId, review);
-            setNotice(`《${d.title}》已标记为已读并保存短评`);
+            await saveBookReview(action.bookId, review, true);
+            setNotice(`《${d.title}》的短评已保存`);
             notifyLibraryRefresh();
+          } else {
+            setNotice(`已取消保存《${d.title}》的短评`);
           }
         } else {
           const ok = await confirm({
@@ -407,26 +336,15 @@ export default function Chatbot() {
       const history = next.filter(
         (m) => m.role === "user" || m.role === "assistant",
       );
-      const res = await chatbotChat(history, taskId);
+      const draftRequested = base.reviewBookId !== undefined && isReviewDraftCommand(text);
+      const res = await chatbotChat(history, taskId, base.reviewBookId, draftRequested);
+      const { message, actions } = prepareReviewReply(res, collectActions(res.steps ?? []), base.reviewBookId, draftRequested);
       mutateSession(sid, (s) => ({
         ...s,
-        messages: [
-          ...s.messages,
-          {
-            role: "assistant",
-            content: res.content,
-            steps: res.steps ?? [],
-          },
-        ],
+        messages: [...s.messages, message],
         savedAt: Date.now(),
       }));
-      // 写操作工具：从轨迹中提取待确认动作，弹窗确认后生效
-      const acts = collectActions(res.steps ?? []);
-      if (acts.length > 0) setActionQueue((q) => [...q, ...acts.map((action) =>
-        action.kind === "status"
-          ? { ...action, autoSaveReview: canSaveReview(base.reviewBookId, action.bookId, action.status) }
-          : action,
-      )]);
+      if (actions.length) setActionQueue((q) => [...q, ...actions]);
     } catch (e) {
       // 打断不算错误：给出友好提示
       if (String(e).includes("已取消") || String(e).includes("任务已取消")) {
@@ -460,7 +378,7 @@ export default function Chatbot() {
       try {
         const ok = await confirm({
           title: "读后书评",
-          message: `是否通过书虫对话，为《${target.title}》生成书评？\n在对话中告诉书虫“生成书评”，书虫就会根据讨论生成书评，并保存到这本书中。`,
+          message: `是否和书虫聊聊《${target.title}》？\n在对话中说「生成短评」，即可编辑草稿并保存到这本书。`,
           okLabel: "开始对话",
           cancelLabel: "暂不",
         });
@@ -565,7 +483,7 @@ export default function Chatbot() {
       const session: ChatSession = {
         ...newSession(),
         ...s,
-        // 导入的会话不能继承本机确认过的直接保存权限。
+        // 导出的数字 ID 属于原书库。
         reviewBookId: undefined,
         id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       };
@@ -658,7 +576,8 @@ export default function Chatbot() {
               </div>
             )}
             {messages.map((m, i) => (
-              <MessageBubble key={i} m={m} onRetry={() => retry(i)} disabled={retryBlocked || !prepareRetry(messages, i)} />
+              <MessageBubble key={i} m={m} onRetry={prepareRetry(messages, i) ? () => retry(i) : undefined}
+                disabled={retryBlocked} />
             ))}
             {busy && (
               <div className="chat-msg assistant">
@@ -698,12 +617,12 @@ export default function Chatbot() {
                   void send();
                 }
               }}
-              disabled={busy}
+              disabled={retryBlocked}
             />
             <button
               className="btn primary chat-send"
               onClick={() => void send()}
-              disabled={busy || !input.trim()}
+              disabled={retryBlocked || !input.trim()}
             >
               发送
             </button>

@@ -194,7 +194,15 @@ struct ChatResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-  message: Message,
+  message: ResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct ResponseMessage {
+  role: String,
+  // 兼容 API 在仅返回工具调用时会将 content 设为 null，也可能省略该字段。
+  content: Option<String>,
+  tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// OpenAI 兼容 usage 字段（部分兼容 API 可能省略，缺省按 0 处理）
@@ -302,22 +310,37 @@ async fn chat_once(
     return Err(LlmError::Api(format!("HTTP {status}: {body}")));
   }
 
-  let chat_resp: ChatResponse = resp.json().await?;
+  let body = resp.bytes().await?;
+  // 用量统计与展示使用 "provider/model"，多服务商下可区分同名模型
+  parse_chat_response(&body, format!("{}/{}", config.provider, config.model))
+}
+
+fn parse_chat_response(body: &[u8], model: String) -> Result<ChatOutcome, LlmError> {
+  let chat_resp: ChatResponse = serde_json::from_slice(body)
+    .map_err(|err| LlmError::Parse(err.to_string()))?;
   let choice = chat_resp
     .choices
     .into_iter()
     .next()
     .ok_or_else(|| LlmError::Parse("响应中没有 choices".into()))?;
+  let message = choice.message;
+  if message.role != "assistant" {
+    return Err(LlmError::Parse(format!("回复角色应为 assistant，实际为 {}", message.role)));
+  }
+  let content = message.content.unwrap_or_default();
+  let tool_calls = message.tool_calls.filter(|calls| !calls.is_empty());
+  if content.trim().is_empty() && tool_calls.is_none() {
+    return Err(LlmError::Parse("回复中既无正文也无工具调用".into()));
+  }
   let usage = chat_resp.usage.map(|u| TokenUsage {
     prompt_tokens: u.prompt_tokens,
     completion_tokens: u.completion_tokens,
     total_tokens: u.total_tokens,
   });
   Ok(ChatOutcome {
-    content: choice.message.content,
-    tool_calls: choice.message.tool_calls,
-    // 用量统计与展示使用 "provider/model"，多服务商下可区分同名模型
-    model: format!("{}/{}", config.provider, config.model),
+    content,
+    tool_calls,
+    model,
     usage: usage.unwrap_or_default(),
   })
 }
@@ -406,6 +429,46 @@ pub async fn translate_to_chinese(text: &str) -> Result<ChatOutcome, LlmError> {
 mod tests {
   use super::*;
   use crate::config::{LlmProvider, LlmSettings};
+
+  #[test]
+  fn tool_only_replies_allow_null_or_omitted_content() {
+    use serde_json::json;
+    let call = json!({
+      "id": "call_1", "type": "function",
+      "function": { "name": "set_book_status", "arguments": r#"{"book_id":452,"status":"已读"}"# }
+    });
+    for message in [
+      json!({ "role": "assistant", "tool_calls": [&call], "content": null }),
+      json!({ "role": "assistant", "tool_calls": [&call] }),
+    ] {
+      let body = json!({ "choices": [{ "message": message }] }).to_string();
+      let outcome = parse_chat_response(body.as_bytes(), "model".into()).unwrap();
+      assert_eq!(outcome.content, "");
+      assert_eq!(outcome.tool_calls.as_deref(), Some(std::slice::from_ref(&call)));
+    }
+  }
+
+  #[test]
+  fn text_replies_preserve_content_and_reject_empty_or_malformed_messages() {
+    use serde_json::json;
+    let body = json!({
+      "choices": [{ "message": { "role": "assistant", "content": " 普通回复\n" } }],
+      "usage": { "total_tokens": 7 }
+    }).to_string();
+    let outcome = parse_chat_response(body.as_bytes(), "model".into()).unwrap();
+    assert_eq!(outcome.content, " 普通回复\n");
+    assert!(outcome.tool_calls.is_none());
+    assert_eq!(outcome.usage.total_tokens, 7);
+    for message in [
+      json!({ "role": "assistant" }),
+      json!({ "role": "assistant", "content": null, "tool_calls": [] }),
+      json!({ "role": "assistant", "content": "  " }),
+      json!({ "role": "assistant", "content": 42 }),
+    ] {
+      let body = json!({ "choices": [{ "message": message }] }).to_string();
+      assert!(matches!(parse_chat_response(body.as_bytes(), "model".into()), Err(LlmError::Parse(_))));
+    }
+  }
 
   fn provider(name: &str, key: &str, base: &str, models: &[&str]) -> LlmProvider {
     LlmProvider {

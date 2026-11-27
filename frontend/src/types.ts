@@ -278,6 +278,8 @@ export interface ChatMessage {
 /** 一次工具调用记录（Agent 轨迹展示） */
 export interface ChatStep {
   tool: string;
+  /** 后端已校验此写操作并请求界面确认。旧会话只展示轨迹，没有此标记。 */
+  pending_confirmation?: boolean;
   /** 实参 JSON 文本 */
   args: string;
   /** 结果摘要（后端已截断） */
@@ -293,7 +295,7 @@ export interface ChatReply {
 
 /** 书虫会话（多轮对话历史；可导出/导入 JSON） */
 export interface ChatSession {
-  /** 用户确认开启的读后讨论，生成书评时可直接保存到此书。 */
+  /** 读后讨论关联的本地书籍。 */
   reviewBookId?: number;
   id: string;
   /** 标题（取首条用户消息） */

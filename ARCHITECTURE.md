@@ -256,7 +256,8 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
   - `update_book_meta(book_id, title?, author?, tags?, description?, series_name?, series_order?)`：修改元数据；
   - `set_book_status(book_id, status, review?, generate_review?)`：切换阅读状态；已读可携带交流总结出的短评或请求打开 AI 引导式短评窗口（`review` 与 `generate_review` 互斥，仅已读有效）；
   - `merge_books(book_ids[])`：按顺序合并为合集（≥2 本）。
-  **后端不直接执行写操作**：`execute_chatbot_tool` 仅做参数校验（书存在 / 状态白名单 / ≥2 本）并返回 `pending_confirmation` 标记；前端 `Chatbot.tsx` 从最终回复的 `steps` 轨迹中解析出待确认动作（`collectActions`，按动作去重排队），逐个弹出与主界面**同一套组件**的确认/编辑窗口 —— `EditMetaModal`（书虫补丁预填到当前值上）、`ConfirmDialog`（状态/短评/合并确认，合并后沿用"是否 LLM 融合简介"固定流程）、`ReviewModal`（苏格拉底短评）—— 用户确认后走既有命令（`update_book_meta`/`set_book_status`/`save_book_review`/`merge_books_gui`）生效并广播 `mna:library-refresh` 事件刷新书架。系统提示要求模型调用写工具后告知用户"请在弹出窗口中确认"，不得声称已完成；
+  后端在完整工具结果通过校验后给步骤设置 `pending_confirmation`。前端按调用顺序去重，用 `EditMetaModal` 或 `ConfirmDialog` 逐项确认，写入成功后广播 `mna:library-refresh`。
+  读后讨论每轮携带本地书籍 ID。用户在对话中要求生成短评后，界面用工具返回的正文或 `<book_review>` 草稿打开编辑框。在读后讨论中输入「生成短评」也支持纯正文回复。用户点击「保存短评」后，`save_book_review` 同时保存正文和已读状态，已读书籍保留原完成时间。操作结果由界面显示。
 - **循环**：最多 `CHATBOT_MAX_ROUNDS=5` 轮工具调用；LLM 超时 120s（长推理链）；预算耗尽会在下一轮调用前被预算咽喉拦截；
 - **可审计**：回复携带 `steps`（工具名 + 实参 + 结果摘要），前端以可折叠记录展示 —— **每执行完一个工具就推送 `chat-progress` 事件**，生成期间实时展示调用轨迹而非只放动画；
 - 降级：未配置 LLM → 命令直接报错（GUI 不显示入口）。
@@ -329,7 +330,7 @@ commit_import（应用编辑 → finalize_import 落盘 → persist_import 入�
 | `llm_status` | LLM 可用性预检（合并本简介导入前提示） | 未配置返回 configured=false |
 | `set_book_status` | 切换阅读状态（想读/在读/已读，已读自动记录完成时间） | 状态值白名单校验 |
 | `llm_chat` | 通用 LLM 对话（GUI AI 书评会话）；用量按 "provider/model" 入库 | 消息序列必须 system 开头 |
-| `save_book_review` | 保存书评（仅写 `books.my_review`，不插个人短评，避免豆瓣短评区重复展示；详情页提供编辑入口） | 空书评拒绝 |
+| `save_book_review` | 保存到 `books.my_review`。详情页仅更新正文，书虫传 `markRead` 时一并标记已读 | 拒绝空书评，目标已删除时返回错误 |
 | `get_reader_content` | 内置阅读器：按 spine 提取章节正文（脚本/事件属性剥离 + 图片 data URI 内联，单图 10MB/全书 64MB 预算上限） | 大书解析走 spawn_blocking；无章节时报错 |
 | `reset_book_series` | 按各 clasp 来源系列信息重设书籍系列（inherit_series 规则；旧数据缺系列自动回拉详情回填来源行）并同步 EPUB 副本 | 来源系列不一致时报错拒绝 |
 | `webdav_test` / `webdav_push` / `webdav_pull` | WebDav 连接测试（按书库名建远程子目录 + PROPFIND）/ **同步到云端**：本地完整覆盖云端 / **从云端同步**：云端完整覆盖本地（详见 §12） | 仅手动触发、**仅当前书库**可同步（后端校验 current_library）；进度经 task-progress 实时推送（phase 前缀 `webdav-`），task_id 注册 SyncTaskRegistry 供「打断」；凭据存 config.toml |

@@ -432,10 +432,21 @@ pub fn mark_book_finished(conn: &Connection, book_id: i64) -> SqlResult<()> {
 
 /// 保存用户书评到 books.my_review
 pub fn save_review(conn: &Connection, book_id: i64, review: &str) -> SqlResult<()> {
-  conn.execute(
-    "UPDATE books SET my_review = ?1 WHERE id = ?2",
-    rusqlite::params![review, book_id],
-  )?;
+  save_review_with_status(conn, book_id, review, false)
+}
+
+/// 保存用户书评，可同时标记已读。已读书籍保留原完成时间。
+pub fn save_review_with_status(conn: &Connection, book_id: i64, review: &str, mark_read: bool) -> SqlResult<()> {
+  let update = if mark_read {
+    "UPDATE books SET my_review = ?1, status = '已读',
+       finished_date = CASE WHEN status IS NOT '已读' THEN datetime('now','localtime') ELSE finished_date END
+     WHERE id = ?2"
+  } else {
+    "UPDATE books SET my_review = ?1 WHERE id = ?2"
+  };
+  if conn.execute(update, rusqlite::params![review, book_id])? == 0 {
+    return Err(rusqlite::Error::QueryReturnedNoRows);
+  }
   Ok(())
 }
 
@@ -1631,6 +1642,49 @@ mod tests {
     let d = get_book_detail(&conn, id).unwrap().unwrap();
     assert_eq!(d.status, "已读");
     assert!(d.finished_date.is_some());
+  }
+
+  #[test]
+  fn saving_a_review_optionally_marks_read_and_preserves_the_finish_date() {
+    let conn = test_conn();
+    let id = insert_book(&conn, "测试书", "作者", "推理小说", "test.epub", "[]").unwrap();
+    set_book_status(&conn, id, "在读").unwrap();
+    save_review(&conn, id, "详情页短评").unwrap();
+    let d = get_book_detail(&conn, id).unwrap().unwrap();
+    assert_eq!(d.status, "在读");
+    assert!(d.finished_date.is_none());
+    assert_eq!(d.my_review.as_deref(), Some("详情页短评"));
+
+    save_review_with_status(&conn, id, "标记已读并保存", true).unwrap();
+    let d = get_book_detail(&conn, id).unwrap().unwrap();
+    assert_eq!(d.status, "已读");
+    assert!(d.finished_date.is_some());
+    assert_eq!(d.my_review.as_deref(), Some("标记已读并保存"));
+
+    conn.execute("UPDATE books SET finished_date = '2020-01-02 03:04:05' WHERE id = ?1", [id]).unwrap();
+    save_review_with_status(&conn, id, "修订后的短评", true).unwrap();
+    let d = get_book_detail(&conn, id).unwrap().unwrap();
+    assert_eq!(d.my_review.as_deref(), Some("修订后的短评"));
+    assert_eq!(d.finished_date.as_deref(), Some("2020-01-02 03:04:05"));
+  }
+
+  #[test]
+  fn failed_review_save_leaves_status_untouched_and_reports_missing_book() {
+    let conn = test_conn();
+    let id = insert_book(&conn, "测试书", "作者", "推理小说", "test.epub", "[]").unwrap();
+    conn.execute_batch(
+      "CREATE TRIGGER reject_review BEFORE UPDATE OF my_review ON books
+       BEGIN SELECT RAISE(ABORT, 'review write failed'); END;"
+    ).unwrap();
+    assert!(save_review_with_status(&conn, id, "写入失败", true).is_err());
+    let d = get_book_detail(&conn, id).unwrap().unwrap();
+    assert_eq!(d.status, "想读");
+    assert!(d.my_review.is_none() && d.finished_date.is_none());
+
+    delete_book(&conn, id).unwrap();
+    for mark_read in [true, false] {
+      assert!(matches!(save_review_with_status(&conn, id, "已删除", mark_read), Err(rusqlite::Error::QueryReturnedNoRows)));
+    }
   }
 
   /// LLM 用量按模型累加

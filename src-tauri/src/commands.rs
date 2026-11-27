@@ -2642,7 +2642,12 @@ fn truncate_for_prompt(s: &str, max: usize) -> String {
 /// 由模型经 search_books / get_book_detail / get_book_comments 等工具按需检索，
 /// 因此可以全量列出书目（上限 CHATBOT_KNOWLEDGE_BOOKS，超出部分提示用工具检索），
 /// 而不会让系统提示随书库规模线性膨胀到触发网关重置连接。
-fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -> String {
+fn build_chatbot_system(
+  conn: &rusqlite::Connection,
+  library_id: Option<&str>,
+  review_book_id: Option<i64>,
+  review_draft_requested: bool,
+) -> String {
   const CHATBOT_KNOWLEDGE_BOOKS: usize = 1000;
   let cfg = AppConfig::load();
   let lib_title = cfg
@@ -2694,6 +2699,30 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
     ));
   }
 
+  // 目标来自界面保存的会话信息；长对话截断首条用户消息后仍然可用。
+  let review_context = match review_book_id {
+    Some(id) => match db::get_book_detail(conn, id) {
+      Ok(Some(book)) => {
+        let mut context = format!(
+          "本次读后讨论关联本地 book_id={id}《{}》。用户明确要求生成书评即可准备这本书的可编辑草稿。\
+请在回复中展示书评，并在同一轮实际调用 set_book_status（book_id={id}、status=已读、review=完整书评正文）。\
+若工具未成功调用，请用 <book_review book_id=\"{id}\">完整书评正文</book_review> 提交可编辑草稿。\
+仅讨论、结束聊天、只展示或明确不保存时均不提交草稿。\n", book.title
+        );
+        if review_draft_requested {
+          context.push_str("用户本轮明确要求生成短评，请根据讨论完成短评。如果未成功调用工具，最终回复只给上述标记包裹的完整短评正文，不附标题以外的说明、弹窗提示或后续问题。\n");
+        }
+        context
+      }
+      Ok(None) => format!("本次读后讨论关联的本地书籍 book_id={id} 已不存在，请告知用户并保留书评草稿。\n"),
+      Err(e) => {
+        warn!("书虫读取讨论目标 book_id={id} 失败: {e}");
+        format!("本次读后讨论关联的本地书籍 book_id={id} 暂时无法读取，请保留书评草稿。\n")
+      }
+    },
+    None => String::new(),
+  };
+
   format!(
     "你是本地推理小说书架应用的阅读助手「书虫」。用户正在使用「{lib_title}」书库（共 {total} 本书）。\
 你可以回答关于这些书的问题、推荐阅读、比较作品、根据状态与短评总结用户的阅读品味。\
@@ -2730,12 +2759,16 @@ fn build_chatbot_system(conn: &rusqlite::Connection, library_id: Option<&str>) -
 列表和全文可能有剧透，依用户讨论范围使用；遇到访问限制应说明并回退本地缓存，不把失败视为没有评论。\n\
 你也可以代用户发起写操作（修改元数据 / 切换阅读状态 / 合并书籍）：\n\
 - update_book_meta：修改元数据（只传需要改的字段）\n\
-- set_book_status：切换阅读状态；标记已读可携带双方交流总结出的短评，\
-只有用户明确要求生成书评时才生成，明确要求保存或已在读后讨论中授权生成后保存时，携带 review 请求保存；不要将结束聊天视为生成或保存授权。\n\
-或请求在书虫中新建读后讨论会话（由用户决定何时生成书评）\n\
+- set_book_status：切换阅读状态，或为已读书籍提交双方交流总结出的短评。\
+用户明确要求保存短评时，调用此工具并把完整正文放在 review 中。\
+也可以用 generate_review 请求新建读后讨论；讨论时只在用户明确要求生成书评时才生成。\n\
 - merge_books：把多本（上下册/系列）按顺序合并为合集\n\
-读后讨论中用户已授权的对应书籍书评会由应用直接保存；其他写操作会弹出确认或编辑窗口，由用户最终确认。\
-需确认的操作调用后请告知用户「已在界面弹出窗口，请在窗口中确认」；已授权书评保存请告知已提交保存、以界面保存结果为准，不要声称已完成修改。\n\n\
+{review_context}\
+用户明确要求生成并拟保存短评时，首选实际调用 set_book_status，传入真实本地 book_id、status=已读 和完整 review。\
+若本轮尚未成功调用该工具（含纯文本模式），可以把完整短评正文单独放进 <book_review book_id=\"真实本地ID\">…</book_review>，\
+将属性值换成已知的本地数字 ID。应用会据此准备同一份可编辑草稿；不知道 ID 时先询问用户。\
+仅讨论、只要求展示或明确不保存时，不调用写工具，也不使用草稿标记。短评由用户在界面编辑并点击保存后才写入。\
+写工具的返回值只表示请求通过校验。聊天中不要宣称窗口已弹出、数据已保存或用户已确认；实际进度由界面反馈。\n\n\
 == 书库概览（书名/作者/系列，按已读/未读分组；简介与短评请用工具查询）==\n{knowledge}",
     lib_title = lib_title,
     total = books.len(),
@@ -2866,7 +2899,7 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "update_book_meta",
-        "description": "修改某本书的元数据（书名/作者/标签/简介/系列）。不直接生效：会弹出与详情页一致的编辑窗口，由用户确认后才保存。只传需要修改的字段，未传字段保持原值。",
+        "description": "请求修改某本书的元数据（书名/作者/标签/简介/系列），由界面处理。只传需要修改的字段，未传字段保持原值。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -2886,13 +2919,13 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "set_book_status",
-        "description": "修改某本书的阅读状态（想读/在读/已读）。不直接生效：会弹出确认窗口由用户确认。标记已读时可选携带短评（与用户交流总结得到的），或请求在书虫中新建读后讨论会话（由用户决定何时生成书评）。",
+        "description": "请求修改阅读状态（想读/在读/已读）、为已读书籍提交可编辑的短评草稿，或新建读后讨论。书已读时也可提交 review。用户在界面点击保存后才写入短评。",
         "parameters": {
           "type": "object",
           "properties": {
             "book_id": { "type": "integer", "description": "书籍 ID" },
             "status": { "type": "string", "description": "目标状态：想读 / 在读 / 已读" },
-            "review": { "type": "string", "description": "短评内容（仅状态为已读时有意义；来自与用户的交流，需用户确认后保存）" },
+            "review": { "type": "string", "description": "完整短评正文（仅用于已读书籍；来自与用户的交流）" },
             "generate_review": { "type": "boolean", "description": "true = 在书虫中新建读后讨论会话（由用户决定何时生成书评）（与 review 互斥；仅已读状态有意义）" }
           },
           "required": ["book_id", "status"]
@@ -2903,7 +2936,7 @@ fn chatbot_tools() -> Vec<serde_json::Value> {
       "type": "function",
       "function": {
         "name": "merge_books",
-        "description": "把多本书按给定顺序合并为一个合集（EPUB + 来源 + 短评，删除原书记录；第一本的封面作为合集封面）。不直接生效：会弹出确认窗口，由用户确认后执行固定合并流程。适用于上下册/系列合集。",
+        "description": "请求把多本书按给定顺序合并为一个合集（EPUB + 来源 + 短评，删除原书记录；第一本的封面作为合集封面）。由界面处理确认和合并。适用于上下册/系列合集。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -3112,7 +3145,7 @@ fn execute_chatbot_tool(
       match db::get_book_detail(conn, id) {
         Ok(Some(d)) => serde_json::json!({
           "status": "pending_confirmation",
-          "message": format!("已请求用户在弹出的编辑窗口中确认《{}》的元数据修改（当前值已在窗口中预填，未传字段保持原值）", d.title),
+          "message": format!("《{}》的元数据修改请求已通过校验，后续由界面处理", d.title),
         })
         .to_string(),
         Ok(None) => err("书籍不存在".into()),
@@ -3130,7 +3163,14 @@ fn execute_chatbot_tool(
         return err(format!("无效的状态「{status}」（仅支持 想读 / 在读 / 已读）"));
       }
       let review = get_str("review");
-      let generate = args.get("generate_review").and_then(|v| v.as_bool()).unwrap_or(false);
+      if args.get("review").is_some_and(|v| !v.is_null()) && review.is_none() {
+        return err("review 必须为非空书评正文".into());
+      }
+      let generate = match args.get("generate_review") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(_) => return err("generate_review 必须为布尔值".into()),
+      };
       if status != "已读" && (review.is_some() || generate) {
         return err("review / generate_review 仅在标记「已读」时有效".into());
       }
@@ -3141,11 +3181,11 @@ fn execute_chatbot_tool(
         Ok(Some(d)) => serde_json::json!({
           "status": "pending_confirmation",
           "message": format!(
-            "已请求用户确认将《{}》标记为「{status}」{}",
+            "《{}》的请求已通过校验，后续由界面处理（目标状态「{status}」{}）",
             d.title,
             match (&review, generate) {
-              (Some(_), _) => "并保存给定的短评",
-              (None, true) => "并打开 AI 短评生成窗口",
+              (Some(_), _) => "，附短评正文",
+              (None, true) => "，请求开始读后讨论",
               (None, false) => "",
             }
           ),
@@ -3175,7 +3215,7 @@ fn execute_chatbot_tool(
       serde_json::json!({
         "status": "pending_confirmation",
         "message": format!(
-          "已请求用户确认按顺序合并 {} 本书：{}。确认后将执行固定合并流程（原书记录移除，第一本封面作为合集封面）",
+          "按顺序合并 {} 本书的请求已通过校验，后续由界面处理：{}",
           titles.len(),
           titles.iter().map(|t| format!("《{t}》")).collect::<Vec<_>>().join("、")
         ),
@@ -3183,6 +3223,38 @@ fn execute_chatbot_tool(
       .to_string()
     }
     _ => err(format!("未知工具: {name}")),
+  }
+}
+
+/// 只保留以用户发言开头的最近对话，避免截断后以助手消息紧跟系统提示。
+fn recent_chatbot_history(messages: Vec<ChatMessageDto>) -> Result<Vec<agent::Message>, String> {
+  const HISTORY_MAX: usize = 16;
+  let history: Vec<_> = messages.into_iter()
+    .filter(|m| m.role == "user" || m.role == "assistant")
+    .collect();
+  let start = history.len().saturating_sub(HISTORY_MAX);
+  let recent: Vec<_> = history.into_iter()
+    .skip(start)
+    .skip_while(|m| m.role != "user")
+    .map(|m| agent::Message { role: m.role, content: m.content, tool_calls: None, tool_call_id: None })
+    .collect();
+  if recent.is_empty() {
+    return Err("对话中缺少用户消息".into());
+  }
+  Ok(recent)
+}
+
+/// 对话中的短评生成请求只授权准备绑定书籍的草稿，查询工具照常可用。
+fn review_draft_tool_error(book_id: Option<i64>, tool: &str, args: &serde_json::Value) -> Option<String> {
+  let id = book_id?;
+  match tool {
+    "set_book_status" if args["book_id"].as_i64() == Some(id)
+      && args["status"].as_str() == Some("已读")
+      && args["review"].as_str().is_some_and(|s| !s.trim().is_empty()) => None,
+    "set_book_status" | "update_book_meta" | "merge_books" => Some(format!(
+      "本轮只生成本地 book_id={id} 的短评。请调用 set_book_status，传入 book_id={id}、status=已读 和完整非空的 review 正文。"
+    )),
+    _ => None,
   }
 }
 
@@ -3202,16 +3274,13 @@ pub async fn chatbot_chat(
   app: tauri::AppHandle,
   messages: Vec<ChatMessageDto>,
   task_id: Option<String>,
+  review_book_id: Option<i64>,
+  review_draft_requested: Option<bool>,
 ) -> Result<ChatReplyDto, String> {
   const CHATBOT_MAX_ROUNDS: usize = 5;
   /// 单次 LLM 请求超时：agent 循环的 prompt 含数十 KB 系统提示，30s 极易超时
   const CHATBOT_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-  /// 历史消息上限（超出时保留最近的，控制每轮请求体积）
-  const CHATBOT_HISTORY_MAX: usize = 16;
-
-  if messages.is_empty() {
-    return Err("消息不能为空".into());
-  }
+  let history = recent_chatbot_history(messages)?;
   let config = agent::resolve_config()
     .ok_or_else(|| "未配置 LLM（请在设置页配置后重试）".to_string())?;
   let lib_id = AppConfig::load().current_library_id().map(str::to_string);
@@ -3231,27 +3300,14 @@ pub async fn chatbot_chat(
     }
   };
 
+  let draft_book_id = review_book_id.filter(|_| review_draft_requested == Some(true));
   // 系统提示（短暂持锁读取 DB）
   let system = {
     let conn = state.lock().map_err(|e| e.to_string())?;
-    build_chatbot_system(&conn, lib_id.as_deref())
+    build_chatbot_system(&conn, lib_id.as_deref(), review_book_id, draft_book_id.is_some())
   };
-  // 消息序列：system → user/assistant 交替（忽略前端传入的 system）；
-  // 历史超限时只保留最近的 CHATBOT_HISTORY_MAX 条，控制每轮请求体积
-  let history: Vec<ChatMessageDto> = messages
-    .into_iter()
-    .filter(|m| m.role == "user" || m.role == "assistant")
-    .collect();
-  let history_start = history.len().saturating_sub(CHATBOT_HISTORY_MAX);
   let mut msgs: Vec<agent::Message> = vec![agent::Message::system(system)];
-  for m in &history[history_start..] {
-    msgs.push(agent::Message {
-      role: m.role.clone(),
-      content: m.content.clone(),
-      tool_calls: None,
-      tool_call_id: None,
-    });
-  }
+  msgs.extend(history);
 
   let tools = chatbot_tools();
   let mut tools_enabled = true;
@@ -3265,6 +3321,11 @@ pub async fn chatbot_chat(
       finish(&registry);
       return Err(CANCELLED_MSG.into());
     }
+    if !tools_enabled {
+      if let Some(system) = msgs.first_mut() {
+        system.content.push_str("\n本轮只能返回文本。需要提交短评草稿且此前工具未成功时，使用上述 book_review 格式。");
+      }
+    }
     // LLM 调用与取消信号竞速：打断时中止进行中的请求
     let call = if tools_enabled {
       agent::chat_with_tools_timeout(&config, &msgs, Some(&tools), CHATBOT_LLM_TIMEOUT)
@@ -3272,8 +3333,9 @@ pub async fn chatbot_chat(
       agent::chat_with_tools_timeout(&config, &msgs, None, CHATBOT_LLM_TIMEOUT)
     };
     let outcome = tokio::select! {
-      r = call => r,
+      biased;
       _ = cancel.wait_cancelled() => Err(agent::LlmError::Parse("已取消".into())),
+      r = call => r,
     };
     let outcome = match outcome {
       Ok(o) => o,
@@ -3296,6 +3358,14 @@ pub async fn chatbot_chat(
           }
         }
         finish(&registry);
+        if steps.iter().any(|s| s.pending_confirmation) {
+          warn!("书虫已校验写操作，但生成后续回复失败: {e}");
+          return Ok(ChatReplyDto {
+            content: "后续回复生成失败。已通过校验的操作将由界面处理。".into(),
+            model: format!("{}/{}", config.provider, config.model),
+            steps,
+          });
+        }
         return Err(e.to_string());
       }
     };
@@ -3326,37 +3396,6 @@ pub async fn chatbot_chat(
       });
     };
 
-    if rounds >= CHATBOT_MAX_ROUNDS {
-      // 轮次上限：不带工具强制模型给出最终回答
-      let final_call = agent::chat_with_tools_timeout(&config, &msgs, None, CHATBOT_LLM_TIMEOUT);
-      let final_outcome = tokio::select! {
-        r = final_call => r,
-        _ = cancel.wait_cancelled() => Err(agent::LlmError::Parse("已取消".into())),
-      };
-      let final_outcome = match final_outcome {
-        Ok(o) => o,
-        Err(_) => {
-          finish(&registry);
-          return Err(CANCELLED_MSG.into());
-        }
-      };
-      {
-        let conn = state.lock().map_err(|e| e.to_string())?;
-        let _ = db::record_llm_usage(
-          &conn,
-          &final_outcome.model,
-          final_outcome.usage.prompt_tokens,
-          final_outcome.usage.completion_tokens,
-          final_outcome.usage.total_tokens,
-        );
-      }
-      finish(&registry);
-      return Ok(ChatReplyDto {
-        content: final_outcome.content,
-        model: final_outcome.model,
-        steps,
-      });
-    }
     rounds += 1;
 
     // 回传 assistant 的工具调用请求
@@ -3389,7 +3428,9 @@ pub async fn chatbot_chat(
         .to_string();
       let args: serde_json::Value = serde_json::from_str(&arg_str)
         .unwrap_or(serde_json::Value::Object(Default::default()));
-      let result = if matches!(name.as_str(), "get_book_outline" | "read_book_section" | "search_book_text") {
+      let result = if let Some(error) = review_draft_tool_error(draft_book_id, &name, &args) {
+        serde_json::json!({"error": error}).to_string()
+      } else if matches!(name.as_str(), "get_book_outline" | "read_book_section" | "search_book_text") {
         let target = {
           let conn = state.lock().map_err(|e| e.to_string())?;
           chatbot_text_path(&conn, lib_id.as_deref(), &args)
@@ -3446,11 +3487,7 @@ pub async fn chatbot_chat(
         let conn = state.lock().map_err(|e| e.to_string())?;
         execute_chatbot_tool(&conn, lib_id.as_deref(), &name, &args)
       };
-      steps.push(ChatStepDto {
-        tool: name.clone(),
-        args: arg_str,
-        result: result.chars().take(1500).collect(),
-      });
+      steps.push(ChatStepDto::from_result(name, arg_str, &result));
       msgs.push(agent::Message {
         role: "tool".into(),
         content: result,
@@ -3459,6 +3496,10 @@ pub async fn chatbot_chat(
       });
       // 实时推送当前工具轨迹（打断检查放在每轮 LLM 调用前）
       progress(&steps);
+    }
+    // 到达上限后下一轮只生成文本，避免先征求一次新工具调用再将其丢弃。
+    if rounds >= CHATBOT_MAX_ROUNDS {
+      tools_enabled = false;
     }
   }
 }
@@ -4041,6 +4082,18 @@ pub struct ChatStepDto {
   pub args: String,
   /// 结果（截断）
   pub result: String,
+  /// 后端校验通过的写请求；界面依据此字段调度动作。
+  pub pending_confirmation: bool,
+}
+
+impl ChatStepDto {
+  fn from_result(tool: String, args: String, result: &str) -> Self {
+    // 仅本地写工具可以派发动作，在截断展示摘要前检查完整结果。
+    let pending_confirmation = matches!(tool.as_str(), "update_book_meta" | "set_book_status" | "merge_books")
+      && serde_json::from_str::<serde_json::Value>(result)
+        .is_ok_and(|r| r["status"] == "pending_confirmation");
+    Self { tool, args, result: result.chars().take(1500).collect(), pending_confirmation }
+  }
 }
 
 /// 通用 LLM 对话（消息序列必须 system 开头）；每次调用的 token 用量入库
@@ -4078,20 +4131,23 @@ pub async fn llm_chat(
   })
 }
 
-/// 保存书评（仅写入 books.my_review，不插入个人短评，避免豆瓣短评区重复展示）
+/// 保存到 books.my_review；书虫确认时可一并标记已读。
 #[tauri::command]
 pub async fn save_book_review(
   state: State<'_, Mutex<rusqlite::Connection>>,
   id: i64,
   review: String,
+  mark_read: Option<bool>,
 ) -> Result<(), String> {
-  let review = review.trim().to_string();
+  let review = review.trim();
   if review.is_empty() {
     return Err("书评不能为空".into());
   }
   let conn = state.lock().map_err(|e| e.to_string())?;
-  db::save_review(&conn, id, &review).map_err(|e| e.to_string())?;
-  Ok(())
+  db::save_review_with_status(&conn, id, review, mark_read.unwrap_or(false)).map_err(|e| match e {
+    rusqlite::Error::QueryReturnedNoRows => format!("书籍不存在（book_id {id}）"),
+    other => other.to_string(),
+  })
 }
 
 #[cfg(test)]
@@ -4210,6 +4266,79 @@ mod tests {
     assert!(r.contains("至少需要 2 本"), "{r}");
     let r = execute_chatbot_tool(&conn, None, "merge_books", &serde_json::json!({ "book_ids": [a, 999] }));
     assert!(r.contains("不存在"), "{r}");
+  }
+
+  #[test]
+  fn truncated_chatbot_history_starts_with_a_user_message() {
+    let messages = (0..17).map(|i| ChatMessageDto {
+      role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+      content: i.to_string(),
+    }).collect();
+    let recent = recent_chatbot_history(messages).unwrap();
+    assert_eq!(recent[0].role, "user");
+    assert_eq!(recent[0].content, "2");
+    assert_eq!(recent.last().unwrap().content, "16");
+    let only_assistant = vec![ChatMessageDto { role: "assistant".into(), content: "旧回复".into() }];
+    assert!(recent_chatbot_history(only_assistant).is_err());
+  }
+
+  #[test]
+  fn review_request_only_accepts_a_review_for_the_bound_book() {
+    let valid = serde_json::json!({"book_id": 452, "status": "已读", "review": "书评正文"});
+    assert!(review_draft_tool_error(Some(452), "set_book_status", &valid).is_none());
+    assert!(review_draft_tool_error(Some(452), "get_book_detail", &serde_json::json!({"book_id": 1})).is_none());
+    for (tool, args) in [
+      ("set_book_status", serde_json::json!({"book_id": 1, "status": "已读", "review": "正文"})),
+      ("set_book_status", serde_json::json!({"book_id": 452, "status": "在读", "review": "正文"})),
+      ("set_book_status", serde_json::json!({"book_id": 452, "status": "已读", "review": "  "})),
+      ("set_book_status", serde_json::json!({"book_id": 452, "status": "已读"})),
+      ("update_book_meta", serde_json::json!({"book_id": 452, "title": "改名"})),
+      ("merge_books", serde_json::json!({"book_ids": [452, 1]})),
+    ] {
+      assert!(review_draft_tool_error(None, tool, &args).is_none());
+      let error = review_draft_tool_error(Some(452), tool, &args).unwrap();
+      assert!(error.contains("book_id=452"));
+      let result = serde_json::json!({"error": error}).to_string();
+      assert!(!ChatStepDto::from_result(tool.into(), args.to_string(), &result).pending_confirmation);
+    }
+  }
+
+  #[test]
+  fn review_prompt_uses_the_bound_book_for_each_turn() {
+    let conn = mem_db();
+    let id = db::insert_book(&conn, "钟表馆事件", "绫辻行人", "推理小说", "a.epub", "[]").unwrap();
+    let bound = build_chatbot_system(&conn, None, Some(id), false);
+    assert!(bound.contains(&format!("本次读后讨论关联本地 book_id={id}《钟表馆事件》")));
+    assert!(bound.contains(&format!(r#"<book_review book_id="{id}">"#)));
+    assert!(!bound.contains("用户本轮明确要求生成短评"));
+    let requested = build_chatbot_system(&conn, None, Some(id), true);
+    assert!(requested.contains("用户本轮明确要求生成短评"));
+    let general = build_chatbot_system(&conn, None, None, true);
+    assert!(general.contains("book_review"));
+    assert!(!general.contains("本次读后讨论关联本地"));
+    assert!(!general.contains("用户本轮明确要求生成短评"));
+    let missing = build_chatbot_system(&conn, None, Some(id + 1), true);
+    assert!(missing.contains("已不存在"));
+    assert!(!missing.contains("用户本轮明确要求生成短评"));
+  }
+
+  #[test]
+  fn only_validated_write_steps_are_dispatched_even_when_the_preview_is_truncated() {
+    let conn = mem_db();
+    let title = "钟".repeat(1600);
+    let id = db::insert_book(&conn, &title, "作者", "推理小说", "a.epub", "[]").unwrap();
+    let step_for = |args: serde_json::Value| {
+      let result = execute_chatbot_tool(&conn, None, "set_book_status", &args);
+      ChatStepDto::from_result("set_book_status".into(), args.to_string(), &result)
+    };
+    let step = step_for(serde_json::json!({"book_id": id, "status": "已读", "review": "书评正文"}));
+    assert!(step.pending_confirmation);
+    assert!(serde_json::from_str::<serde_json::Value>(&step.result).is_err());
+    assert!(!step_for(serde_json::json!({"book_id": id, "status": "在读", "review": "书评正文"})).pending_confirmation);
+    assert!(!step_for(serde_json::json!({"book_id": id, "status": "已读", "review": "  "})).pending_confirmation);
+    assert!(!step_for(serde_json::json!({"book_id": id, "status": "已读", "generate_review": "false"})).pending_confirmation);
+    let read = ChatStepDto::from_result("get_book_detail".into(), "{}".into(), r#"{"status":"pending_confirmation"}"#);
+    assert!(!read.pending_confirmation);
   }
 
   /// claspclub 检索结果格式化：来源标注 / fuzzy 标记 / 本地检索指引

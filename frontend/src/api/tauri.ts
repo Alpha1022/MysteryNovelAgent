@@ -82,10 +82,11 @@ export function switchLibrary(id: string): Promise<string> {
   return invoke("switch_library", { id });
 }
 
-/** Chatbot 对话（系统提示由后端按数据库实时构建） */
 /** 书虫对话（agent 循环；进度经 chat-progress 事件实时推送，task_id 供打断） */
-export function chatbotChat(messages: ChatMessage[], taskId?: string): Promise<ChatReply> {
-  return invoke("chatbot_chat", { messages, taskId });
+export function chatbotChat(
+  messages: ChatMessage[], taskId?: string, reviewBookId?: number, reviewDraftRequested = false,
+): Promise<ChatReply> {
+  return invoke("chatbot_chat", { messages, taskId, reviewBookId, reviewDraftRequested });
 }
 
 /** 分析 EPUB（提取元数据 + claspclub 静默匹配） */
@@ -206,9 +207,9 @@ export function llmChat(messages: ChatMessage[]): Promise<ChatReply> {
   return invoke("llm_chat", { messages });
 }
 
-/** 保存书评（仅写入 my_review） */
-export function saveBookReview(id: number, review: string): Promise<void> {
-  return invoke("save_book_review", { id, review });
+/** 保存书评；书虫确认保存时可同时标记已读。 */
+export function saveBookReview(id: number, review: string, markRead = false): Promise<void> {
+  return invoke("save_book_review", { id, review, markRead });
 }
 
 /** claspclub 分页搜索（pageSize=5，按豆瓣评分排序，结果含简介/封面） */
